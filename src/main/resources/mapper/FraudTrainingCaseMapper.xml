@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd" >
+<mapper namespace="com.rental.guard.ai.infrastructure.mapper.FraudTrainingCaseMapper">
+    <resultMap id="BaseResultMap" type="com.rental.guard.ai.infrastructure.po.PoFraudTrainingCase">
+        <id column="id" property="id" jdbcType="BIGINT"/>
+        <result column="chat_content" property="chatContent" jdbcType="VARCHAR"/>
+        <result column="is_fraud" property="isFraud" jdbcType="INTEGER"/>
+        <result column="fraud_type" property="fraudType" jdbcType="INTEGER"/>
+        <result column="source" property="source" jdbcType="VARCHAR"/>
+        <result column="confidence_score" property="confidenceScore" jdbcType="NUMERIC"/>
+        <result column="description" property="description" jdbcType="VARCHAR"/>
+
+        <result column="create_time" property="createTime" jdbcType="TIMESTAMP"/>
+        <result column="update_time" property="updateTime" jdbcType="TIMESTAMP"/>
+
+    </resultMap>
+    <sql id="Base_Column_List">
+        id
+        , chat_content, is_fraud, fraud_type, source, confidence_score,description ,create_time,update_time
+    </sql>
+    <select id="getALlPoFraudTrainingCase" resultMap="BaseResultMap">
+        SELECT
+        <include refid="Base_Column_List"/>
+        FROM fraud_training_case
+    </select>
+
+</mapper>

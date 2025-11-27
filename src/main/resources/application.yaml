@@ -1,0 +1,61 @@
+server:
+  port: 8081
+spring:
+  application:
+    name: RentalGuardAI
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/rental?useUnicode=true&characterEncoding=utf8&useSSL=true&serverTimezone=Asia/Shanghai
+    username: root
+    password: 12345678
+
+logging:
+  level:
+    org.springframework.ai.chat.client.advisor: debug
+    com.rental.guard.ai: debug
+
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+mybatis:
+  mapper-locations: classpath*:mapper/*Mapper.xml,classpath:**/mapper/xml/*.xml,classpath*:mapper/**/*.xml
+  type-aliases-package: com.rental.guard.ai.infrastructure
+  configuration-properties:
+    org.apache.ibatis.parsing.PropertyParser.enable-default-value: true
+  configuration:
+    use-generated-keys: true
+
+# AI配置
+ai:
+  enabled: true
+  provider: deepseek
+  local-model:
+    enabled: true
+    service-type: ollama
+    model-name: deepseek-r1:7b
+    endpoint: http://localhost:11434
+    timeout: 30000          # 30秒超时
+    max-tokens: 2000        # 最大生成token数
+    temperature: 0.1        # 生成随机性，0.0-1.0
+    max-concurrency: 5      # 最大并发请求数
+  fraud-detection:
+    enabled: true
+    async: true
+    timeout: 30000
+    context-message-count: 100
+  deepseek:
+    api-key: sk-630b7df247bd49df89d50cf5373b1c1f
+    endpoint: https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation
+    model: deepseek-r1
+    timeout: 30000
+    max-tokens: 1000
+    temperature: 0.1
+
+  mcp:
+    endpoint: https://dashscope.aliyuncs.com/api/v1/mcps/market-cmapi00035184/sse
+    api-key: sk-630b7df247bd49df89d50cf5373b1c1f
+
+  rag:
+    endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
+    api-key: sk-630b7df247bd49df89d50cf5373b1c1f
