@@ -21,7 +21,8 @@ public class AIConfig {
     /**
      * AI服务提供商：deepseek, local（本地模型）
      */
-    private String provider = "deepseek";
+    //private String provider = "deepseek";
+    private String provider = "ollama";
 
     private FraudDetectionConfig fraudDetection = new FraudDetectionConfig();
 

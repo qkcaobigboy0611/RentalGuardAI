@@ -15,6 +15,9 @@ import com.rental.guard.ai.infrastructure.mapper.MessageMapper;
 import com.rental.guard.ai.infrastructure.po.PoFraudDetectionRecord;
 import com.rental.guard.ai.infrastructure.po.PoFraudTrainingCase;
 import com.rental.guard.ai.infrastructure.po.PoMessage;
+import com.rental.guard.ai.infrastructure.service.CaseRanker;
+import com.rental.guard.ai.infrastructure.service.TrainingCaseRetriever;
+import com.rental.guard.ai.infrastructure.service.VectorSearchService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpEntity;
@@ -27,6 +30,7 @@ import org.springframework.web.client.RestTemplate;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
@@ -48,6 +52,13 @@ public class FraudDetectionServiceImpl implements FraudDetectionService {
     private MessageMapper messageMapper;
     @Autowired
     private ArgConfig argConfig;
+    @Autowired
+    private VectorSearchService vectorSearchService;
+    @Autowired
+    private TrainingCaseRetriever trainingCaseRetriever;
+    @Autowired
+    private CaseRanker caseRanker;
+
 
     @Override
     public ChatContextDto getChatContext(Long channelId, int messageCount) {
@@ -98,6 +109,15 @@ public class FraudDetectionServiceImpl implements FraudDetectionService {
         }
     }
 
+    /**
+     * 优化点：
+     * 1.向量检索优化：预先计算所有训练案例并存储到数据库中，避免每次实时计算；在数据库层面进行相似度的搜索，利用索引加速
+     *
+     * @param chatContext 聊天上下文
+     * @param ip1         用户1IP
+     * @param ip2         用户2IP
+     * @return
+     */
     @Override
     public FraudAnalysisResult analyzeWithAI(String chatContext, String ip1, String ip2) {
         log.debug("执行AI分析 - chatContext: {}", chatContext);
@@ -108,8 +128,8 @@ public class FraudDetectionServiceImpl implements FraudDetectionService {
             // 集成向量模型获取相关案例
             List<PoFraudTrainingCase> relevantTrainingCases = getRelevantTrainingCases(chatContext, trainingCases, 10);
 
-            // 构建包含训练案例的AI分析请求
-            String prompt = FraudDetectionConstants.buildPromptWithTrainingCases(chatContext, relevantTrainingCases);
+            // 构建提示词
+            String prompt = RentalFraudRequestBuilder.buildEnhancedPromptWithTrainingCases(chatContext, relevantTrainingCases, "fraud_detection");
 
             AIAnalysisRequest request = AIAnalysisRequest.fraudDetection(chatContext);
             request.setPrompt(prompt);
@@ -326,13 +346,9 @@ public class FraudDetectionServiceImpl implements FraudDetectionService {
             Map<Integer, List<Float>> caseVectors = new HashMap<>();
             for (PoFraudTrainingCase trainingCase : allCases) {
                 // 可以先预存向量，实时计算向量的话，性能比较差
-                if (trainingCase.getVector() != null) {
-                    caseVectors.put(trainingCase.getId(), parseEmbedding(trainingCase.getVector().toString()));
-                } else {
-                    // 实时计算向量（性能较差，建议预先计算）
-                    List<Float> vector = getEmbedding(trainingCase.getChatContent());
-                    caseVectors.put(trainingCase.getId(), vector);
-                }
+                // 实时计算向量（性能较差，建议预先计算）
+                List<Float> vector = getEmbedding(trainingCase.getChatContent());
+                caseVectors.put(trainingCase.getId(), vector);
             }
 
             // 3. 计算相似度并排序
@@ -377,7 +393,8 @@ public class FraudDetectionServiceImpl implements FraudDetectionService {
 
 
     // 调用阿里云百炼向量模型API
-    private List<Float> getEmbedding(String text) {
+    @Override
+    public List<Float> getEmbedding(String text) {
         try {
             // 构建请求
             HttpHeaders headers = new HttpHeaders();
@@ -443,5 +460,17 @@ public class FraudDetectionServiceImpl implements FraudDetectionService {
         }
 
         return (float) (dotProduct / (Math.sqrt(normA) * Math.sqrt(normB)));
+    }
+
+    /**
+     * 结果融合策略
+     */
+    private List<PoFraudTrainingCase> mergeAndRankCases(
+            List<PoFraudTrainingCase> vectorCases,
+            List<PoFraudTrainingCase> keywordCases,
+            int topK) {
+
+        // 使用优先队列进行融合排序
+        return CaseRanker.mergeAndRank(vectorCases, keywordCases, topK);
     }
 }

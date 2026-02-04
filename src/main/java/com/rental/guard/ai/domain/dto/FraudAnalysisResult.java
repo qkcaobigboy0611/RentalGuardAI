@@ -49,7 +49,15 @@ public class FraudAnalysisResult {
     @JSONField(name = "ip2_address")
     private String ip2Address;
 
+    // 添加对AI返回的其他字段的支持
+    @JSONField(name = "analysis_steps")
+    private List<String> analysisSteps;
 
+    @JSONField(name = "prevention_advice")
+    private List<String> preventionAdvice;
+
+    @JSONField(name = "matched_patterns")
+    private List<String> matchedPatterns;
 
     private Long aiCostTime;
 

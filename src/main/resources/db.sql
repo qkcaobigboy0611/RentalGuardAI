@@ -55,7 +55,7 @@ CREATE TABLE `fraud_training_case`
 ) ENGINE=InnoDB AUTO_INCREMENT=11 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='欺诈训练案例表';
 
 
-CREATE TABLE `message`
+CREATE TABLE `messageNo`
 (
     `id`          int unsigned NOT NULL AUTO_INCREMENT COMMENT 'id',
     `channel_id`  int unsigned DEFAULT NULL COMMENT 'channelId',

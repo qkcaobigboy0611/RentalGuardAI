@@ -7,10 +7,7 @@ package com.rental.guard.ai.domain.service;
 import com.alibaba.fastjson2.JSON;
 import com.baomidou.mybatisplus.core.toolkit.StringUtils;
 import com.rental.guard.ai.config.LocalModelConfig;
-import com.rental.guard.ai.domain.dto.AIAnalysisRequest;
-import com.rental.guard.ai.domain.dto.AIAnalysisResult;
-import com.rental.guard.ai.domain.dto.OllamaRequest;
-import com.rental.guard.ai.domain.dto.OllamaResponse;
+import com.rental.guard.ai.domain.dto.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.*;
@@ -53,21 +50,22 @@ public class OllamaAnalysisServiceImpl implements AIAnalysisService {
         long startTime = System.currentTimeMillis();
 
         try {
-            // 构建Ollama请求
-            OllamaRequest ollamaRequest = OllamaRequest.create(
-                    localModelConfig.getModelName(),
-                    buildPrompt(request),
-                    request.getMaxTokens() != null ? request.getMaxTokens() : localModelConfig.getMaxTokens(),
-                    request.getTemperature() != null ? request.getTemperature() : localModelConfig.getTemperature()
-            );
+            //  构建Ollama请求 基本欺诈检测
+            OllamaRequest ollamaRequest = RentalFraudRequestBuilder.newBuilder()
+                    .model(localModelConfig.getModelName())
+                    .prompt(buildPrompt(request))
+                    .taskType(request.getAnalysisType())
+                    .riskLevel("HIGH")
+                    .includeThinking(true)
+                    .streaming(false)
+                    .build();
 
-            // 设置请求头
+            log.info("调用Ollama本地模型开始，模型: {}, 请求: {}", localModelConfig.getModelName(), JSON.toJSONString(ollamaRequest));
+
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
 
             HttpEntity<OllamaRequest> entity = new HttpEntity<>(ollamaRequest, headers);
-
-            log.info("调用Ollama本地模型开始，模型: {}, 请求: {}", localModelConfig.getModelName(), JSON.toJSONString(ollamaRequest));
 
             // 发送请求
             String endpoint = localModelConfig.getEndpoint() + "/api/generate";

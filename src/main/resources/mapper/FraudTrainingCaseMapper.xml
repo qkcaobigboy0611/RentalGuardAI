@@ -5,7 +5,7 @@
         <id column="id" property="id" jdbcType="BIGINT"/>
         <result column="chat_content" property="chatContent" jdbcType="VARCHAR"/>
         <result column="is_fraud" property="isFraud" jdbcType="INTEGER"/>
-        <result column="fraud_type" property="fraudType" jdbcType="INTEGER"/>
+        <result column="fraud_type" property="fraudType" jdbcType="VARCHAR"/>
         <result column="source" property="source" jdbcType="VARCHAR"/>
         <result column="confidence_score" property="confidenceScore" jdbcType="NUMERIC"/>
         <result column="description" property="description" jdbcType="VARCHAR"/>
@@ -22,6 +22,36 @@
         SELECT
         <include refid="Base_Column_List"/>
         FROM fraud_training_case
+    </select>
+
+    <select id="selectByFraudType" resultMap="BaseResultMap">
+        SELECT
+        <include refid="Base_Column_List"/>
+        FROM fraud_training_case
+        where fraud_type = #{fraudType}
+        ORDER BY create_time DESC
+        LIMIT #{topK}
+    </select>
+
+    <select id="selectByPlatformKeywords" resultMap="BaseResultMap">
+        SELECT
+        <include refid="Base_Column_List"/>
+        FROM fraud_training_case
+        WHERE
+        <foreach collection="keywords" item="keyword" separator=" OR " open="(" close=")">
+            chat_content LIKE CONCAT('%', #{keyword}, '%')
+        </foreach>
+        ORDER BY create_time DESC
+        LIMIT #{topK}
+    </select>
+
+    <select id="selectHighConfidenceCases" resultMap="BaseResultMap">
+        SELECT
+        <include refid="Base_Column_List"/>
+        FROM fraud_training_case
+        where confidence_score > #{confidenceScore}
+        ORDER BY create_time DESC
+        LIMIT #{topK}
     </select>
 
 </mapper>

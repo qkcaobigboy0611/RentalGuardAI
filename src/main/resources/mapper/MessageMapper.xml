@@ -19,7 +19,7 @@
     <select id="selectByChannelAndOffset" resultMap="BaseResultMap">
         SELECT
         <include refid="Base_Column_List" />
-        FROM message
+        FROM messageNo
         WHERE channel_id = #{channelId}
         AND offset BETWEEN #{from} AND #{to}
     </select>

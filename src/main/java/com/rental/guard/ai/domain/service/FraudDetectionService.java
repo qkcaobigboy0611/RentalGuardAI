@@ -7,6 +7,8 @@ package com.rental.guard.ai.domain.service;
 import com.rental.guard.ai.domain.dto.ChatContextDto;
 import com.rental.guard.ai.domain.dto.FraudAnalysisResult;
 
+import java.util.List;
+
 public interface FraudDetectionService {
     /**
      * 获取聊天上下文
@@ -76,5 +78,14 @@ public interface FraudDetectionService {
      */
     void recordDetectionHistory(String triggerUserId, Long channelId, String sensitiveWord,
                                 String triggerMessage, ChatContextDto chatContext, FraudAnalysisResult analysisResult);
+
+
+    /**
+     * 调用阿里云百炼向量模型API
+     * @param text 文本
+     * @return
+     */
+    List<Float> getEmbedding(String text);
+
 
 }

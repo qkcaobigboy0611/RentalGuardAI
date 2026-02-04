@@ -9,6 +9,20 @@ spring:
     username: root
     password: 12345678
 
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 2000ms
+      database: 0
+      jedis:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+          max-wait: -1ms
+          time-between-eviction-runs: 30000ms
+
 logging:
   level:
     org.springframework.ai.chat.client.advisor: debug
@@ -56,6 +70,57 @@ ai:
     endpoint: https://dashscope.aliyuncs.com/api/v1/mcps/market-cmapi00035184/sse
     api-key: sk-630b7df247bd49df89d50cf5373b1c1f
 
+  mcp2:
+    endpoint: https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/sse
+    api-key: sk-630b7df247bd49df89d50cf5373b1c1f
+
   rag:
     endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
     api-key: sk-630b7df247bd49df89d50cf5373b1c1f
+
+milvus:
+  host: c-dc45655ab4c8cb3a.milvus.aliyuncs.com
+  port: 19530
+  database: default
+  username: root
+  password: Cao1567283
+  collection-name: fraud_training_cases
+  vector-dimension: 1024
+  max-collection-size: 1000000
+  search-top-k: 20
+  metric-type: COSINE
+  n-probe: 10
+
+
+# 外部API配置
+api:
+  property:
+    registry:
+      url: https://api.property-registry.gov.cn/v1/verify
+      timeout: 10000
+      retry: 3
+  platform:
+    verification:
+      url: https://api.rental-platform.com/v2/verify-user
+      timeout: 5000
+  risk:
+    assessment:
+      url: https://api.risk-engine.com/v1/assess
+      timeout: 8000
+
+# 工具配置
+tools:
+  image-verification:
+    enabled: true
+    timeout: 15000
+    max-images: 10
+  phone-verification:
+    enabled: true
+    provider: "third-party"
+
+# 人工接管配置
+escalation:
+  human-agent:
+    enabled: true
+    max-wait-time: 120
+    notification-url: "https://internal-support/api/notify"
