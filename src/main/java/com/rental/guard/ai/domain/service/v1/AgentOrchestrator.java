@@ -69,7 +69,7 @@ public class AgentOrchestrator {
     /**
      * 处理用户请求
      */
-    public CompletableFuture<AgentResponse> processRequest(String sessionId, String userInput, String localPath) {
+    public CompletableFuture<AgentResponse> processRequestV2(String sessionId, String userInput, String localPath) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 // 1. 获取或创建会话

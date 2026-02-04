@@ -48,7 +48,7 @@ public class AgentController {
                             .body(Map.of("error", "消息内容不能为空")));
         }
 
-        return agentOrchestrator.processRequest(sessionId, userInput, localPath)
+        return agentOrchestrator.processRequestV2(sessionId, userInput, localPath)
                 .thenApply(response -> {
                     Map<String, Object> result = new HashMap<>();
                     result.put("success", true);
@@ -159,7 +159,7 @@ public class AgentController {
             for (Map.Entry<String, String> entry : testCases.entrySet()) {
                 String sessionId = "test_" + entry.getKey() + "_" + System.currentTimeMillis();
                 CompletableFuture<AgentResponse> future =
-                        agentOrchestrator.processRequest(sessionId, entry.getValue(), null);
+                        agentOrchestrator.processRequestV2(sessionId, entry.getValue(), null);
 
                 try {
                     AgentResponse response = future.get(); // 等待完成
@@ -200,7 +200,7 @@ public class AgentController {
                             .body(Map.of("error", "消息内容不能为空")));
         }
 
-        return agentOrchestrator.processRequest(sessionId, userInput, null)
+        return agentOrchestrator.processRequestV2(sessionId, userInput, null)
                 .thenApply(response -> {
                     Map<String, Object> result = new HashMap<>();
                     result.put("success", true);
