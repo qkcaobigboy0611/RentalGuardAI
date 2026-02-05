@@ -19,15 +19,14 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * ReAct循环引擎 - 实现思考-行动循环
- * <p>
- * 优化点：
- * 1. 动态终止策略：移除硬编码的场景判断，完全由 LLM 根据信息充足度决定是否结束。
- * 2. 增强提示词：明确告知 LLM 何时停止。
- * 3. 鲁棒性提升：增强 JSON 解析能力。
+ * * 优化说明：
+ * 1. 【逻辑优化】evaluateShouldContinue: 移除了基于场景的硬编码终止条件（如强制RAG、强制轮数）。
+ * 现在循环仅在发生系统错误或达到最大迭代次数时强制中断，其余情况由 LLM 自主决定是否给出 final_answer。
+ * 2. 【提示词优化】buildThinkingPrompt: 增加了明确的决策策略指令，指导 LLM 在信息充足时停止循环。
+ * 3. 【稳定性】parseDecision: 增强了 JSON 解析的鲁棒性，防止因格式问题导致循环异常。
  */
 @Slf4j
 public class ReActEngine {
-
     private final LLMService llmService;
     private final ObjectMapper objectMapper;
     private final Map<String, AgentTool> availableTools;
@@ -97,9 +96,9 @@ public class ReActEngine {
                     String actionType = (String) decisionMap.get("action");
 
                     if ("final_answer".equals(actionType)) {
-                        // 生成最终答案
-                        // 优化：优先使用 decision 中的 answer，如果为空则使用 reasoning
+                        // 【优化点】LLM 决定停止循环
                         String answer = (String) decisionMap.get("answer");
+                        // 容错：如果 LLM 忘了写 answer 但写了 reasoning，用 reasoning 兜底
                         if (answer == null || answer.trim().isEmpty()) {
                             answer = (String) decisionMap.get("reasoning");
                         }
@@ -109,14 +108,16 @@ public class ReActEngine {
                                 "决定给出最终答案: " + decisionMap.get("reasoning"));
                         currentStep.setAction("final_answer");
                         steps.add(currentStep);
-                        break;
+                        break; // 退出循环
+
                     } else if ("tool_call".equals(actionType)) {
                         // 执行工具调用
                         List<Map<String, Object>> toolCalls =
                                 (List<Map<String, Object>>) decisionMap.get("tool_calls");
 
+                        // 容错校验
                         if (toolCalls == null || toolCalls.isEmpty()) {
-                            log.warn("决策为 tool_call 但未提供工具列表，跳过");
+                            log.warn("决策为 tool_call 但未提供工具列表，跳过本次执行");
                             continue;
                         }
 
@@ -168,32 +169,27 @@ public class ReActEngine {
 
                         currentStep.setObservation(observations);
 
-                        // 处理工具结果
+                        // 处理工具结果（存入 collectedData 和 allDocuments）
                         processToolResults(observations, collectedData, allDocuments);
 
-                        // 评估是否应该继续
-                        // 优化：逻辑简化，只关注是否有错误。是否继续由下一轮 LLM 决定。
-                        boolean shouldContinue = evaluateShouldContinue(
-                                observations, iteration
-                        );
+                        // 【优化点】动态评估：不再检查场景硬性条件，仅检查系统错误
+                        boolean shouldContinue = evaluateShouldContinue(observations, iteration);
 
                         if (!shouldContinue) {
-                            log.info("ReAct循环因错误提前结束，迭代次数: {}", iteration);
+                            log.info("ReAct循环因工具执行错误提前结束，迭代次数: {}", iteration);
                             break;
                         }
 
                     } else {
                         log.warn("未知的动作类型: {}", actionType);
-                        // 遇到未知动作，保守起见可以再试一次或者直接结束
                         break;
                     }
 
                     // 检查是否达到最大迭代次数
                     if (iteration >= MAX_ITERATIONS) {
                         log.info("达到最大迭代次数: {}", MAX_ITERATIONS);
-                        // 如果最后一次还是工具调用，尝试用已有信息生成总结
                         if (finalAnswer.length() == 0) {
-                            finalAnswer.append("经过多轮分析，基于当前已收集的信息，我的结论如下：\n");
+                            finalAnswer.append("经过多轮分析，基于当前已收集的信息，结论如下：\n");
                             finalAnswer.append(generateSummaryFromSteps(steps, collectedData));
                         }
                         break;
@@ -233,7 +229,8 @@ public class ReActEngine {
     }
 
     /**
-     * 构建思考提示 - 优化版
+     * 【优化核心】构建思考提示
+     * 明确告知 LLM 何时停止，替代原本的代码硬编码逻辑。
      */
     private String buildThinkingPrompt(
             String userInput,
@@ -245,22 +242,20 @@ public class ReActEngine {
         StringBuilder prompt = new StringBuilder();
 
         // 系统指令
-        prompt.append("你是一个租房风险分析智能体。请使用 ReAct（思考-行动）模式来解决用户的问题。\n");
-        prompt.append("你的目标是尽可能准确、全面地回答用户，同时避免不必要的步骤。\n\n");
+        prompt.append("你是一个租房风险分析智能体。使用 ReAct（思考-行动）模式处理问题。\n\n");
 
         // 当前状态
         prompt.append("## 当前状态\n");
-        prompt.append("- 用户问题: <user_query>").append(userInput).append("</user_query>\n");
-        prompt.append("- 场景: ").append(scenario).append("\n");
+        prompt.append("- 用户问题: ").append(userInput).append("\n");
+        prompt.append("- 识别场景: ").append(scenario).append("\n");
         prompt.append("- 当前步骤: ").append(steps.size()).append(" / ").append(MAX_ITERATIONS).append("\n\n");
 
-        // 已收集的信息（带截断，防止 Context 过长）
+        // 已收集的信息 (做截断处理防止 Token 溢出)
         if (!collectedData.isEmpty()) {
             prompt.append("## 已收集的信息\n");
             for (Map.Entry<String, Object> entry : collectedData.entrySet()) {
-                String valueStr = entry.getValue().toString();
                 prompt.append("- ").append(entry.getKey()).append(": ")
-                        .append(truncateString(valueStr, 300))
+                        .append(truncateString(entry.getValue().toString(), 300))
                         .append("\n");
             }
             prompt.append("\n");
@@ -274,16 +269,16 @@ public class ReActEngine {
         }
         prompt.append("\n");
 
-        // 历史步骤
+        // 历史步骤回放
         if (!steps.isEmpty()) {
-            prompt.append("## 历史步骤\n");
+            prompt.append("## 历史思考与行动\n");
             for (ReActStep step : steps) {
                 prompt.append("步骤 ").append(step.getStepNumber()).append(":\n");
                 prompt.append("- 思考: ").append(step.getThought()).append("\n");
                 if (step.getAction() != null) {
                     prompt.append("- 行动: ").append(step.getAction()).append("\n");
                     if (step.getObservation() != null) {
-                        prompt.append("- 观察: ").append(truncateString(
+                        prompt.append("- 观察结果: ").append(truncateString(
                                 step.getObservation().toString(), 200)).append("\n");
                     }
                 }
@@ -291,51 +286,43 @@ public class ReActEngine {
             }
         }
 
-        // 决策指令 - 重点优化部分
-        prompt.append("## 决策策略\n");
-        prompt.append("请基于以上信息，仔细分析并决定下一步行动：\n");
-        prompt.append("1. **tool_call**: 如果你需要更多外部信息（如法律条款、市场价格、地理位置）来回答问题，请调用工具。\n");
-        prompt.append("2. **final_answer**: 如果你**已经收集了足够的信息**，或者**已经尝试查询但无法获取更多信息**，请务必选择此项直接回答。\n");
-        prompt.append("   - **注意**: 不要重复调用已经失败或返回空结果的工具。\n\n");
+        // 【优化核心】决策指令
+        prompt.append("## 决策策略（重要）\n");
+        prompt.append("请基于以上信息决定下一步。请遵循以下逻辑：\n");
+        prompt.append("1. **如果信息不足**：选择 `tool_call` 调用相关工具获取信息（例如查询合同条款、搜索房源地段）。\n");
+        prompt.append("2. **如果信息已足够**：或者用户问题很简单（如问候），或者已尝试查询但无果，请**立即**选择 `final_answer`。\n");
+        prompt.append("   - 不要重复调用相同的工具。\n");
+        prompt.append("   - 不要为了调用工具而调用工具。\n\n");
 
         prompt.append("## 输出格式\n");
-        prompt.append("请仅返回一个合法的 JSON 对象，不要包含 Markdown 标记（如 ```json）。格式如下：\n");
+        prompt.append("请返回严格的 JSON 格式：\n");
+        prompt.append("```json\n");
         prompt.append("{\n");
         prompt.append("  \"action\": \"tool_call\" 或 \"final_answer\",\n");
-        prompt.append("  \"reasoning\": \"简要说明你的思考过程...\",\n");
-
-        prompt.append("  // 仅当 action 为 tool_call 时需要\n");
-        prompt.append("  \"tool_calls\": [\n");
-        prompt.append("    {\n");
-        prompt.append("      \"tool\": \"工具名称\",\n");
-        prompt.append("      \"parameters\": {\"key\": \"value\"}\n");
-        prompt.append("    }\n");
-        prompt.append("  ],\n");
-
-        prompt.append("  // 仅当 action 为 final_answer 时需要\n");
-        prompt.append("  \"answer\": \"对用户问题的完整回答\",\n");
+        prompt.append("  \"reasoning\": \"简要说明你的判断依据\",\n");
+        prompt.append("  \"tool_calls\": [ { \"tool\": \"工具名\", \"parameters\": {...} } ], // 仅当 action=tool_call 时\n");
+        prompt.append("  \"answer\": \"最终回复内容\", // 仅当 action=final_answer 时\n");
         prompt.append("  \"confidence\": 0.95\n");
         prompt.append("}\n");
+        prompt.append("```\n");
 
         return prompt.toString();
     }
 
     /**
-     * 解析决策JSON - 增强鲁棒性
+     * 解析决策JSON (增强鲁棒性)
      */
     private Map<String, Object> parseDecision(String decisionJson) {
         try {
-            // 1. 提取 JSON 字符串（去除可能存在的 Markdown 标记或解释性文字）
             String jsonStr = extractJsonFromResponse(decisionJson);
-            // 2. 解析
             return objectMapper.readValue(jsonStr, Map.class);
         } catch (Exception e) {
-            log.warn("解析决策JSON失败，原始输入: {}", decisionJson, e);
-            // 降级策略：如果解析失败，尝试直接结束，避免死循环或崩溃
+            log.error("解析决策JSON失败: {}", decisionJson, e);
+            // 降级策略：如果解析失败，强制结束以避免死循环
             return Map.of(
                     "action", "final_answer",
-                    "answer", "系统处理您的请求时遇到格式解析问题，请稍后重试。（原始回复: " + truncateString(decisionJson, 50) + "）",
-                    "reasoning", "JSON解析异常，强制终止",
+                    "answer", "系统正在维护中，暂时无法分析具体细节。(JSON Parsing Error)",
+                    "reasoning", "解析失败，自动降级",
                     "confidence", 0.0
             );
         }
@@ -356,7 +343,7 @@ public class ReActEngine {
             if (result instanceof Map) {
                 Map<String, Object> resultMap = (Map<String, Object>) result;
 
-                // 根据工具类型处理结果
+                // 根据工具类型归档数据
                 switch (toolName) {
                     case "rag_retrieval":
                         List<AgentResponse.RetrievedDocument> docs =
@@ -366,34 +353,26 @@ public class ReActEngine {
                             collectedData.put("rag_documents", docs);
                         }
                         break;
-
                     case "web_search":
                         collectedData.put("web_search_results", resultMap.get("results"));
                         break;
-
                     case "conversation_analysis":
                         collectedData.put("conversation_analysis", resultMap.get("analysis_result"));
                         break;
                 }
             }
-
-            // 记录工具调用
+            // 记录该工具已调用，避免 LLM 重复调用
             collectedData.put("last_tool_" + toolName, System.currentTimeMillis());
         }
     }
 
     /**
-     * 评估是否应该继续循环 - 优化版
-     * * 策略：
-     * 不再根据场景硬性规定循环次数或必须调用的工具。
-     * 只要工具执行没有严重错误，就返回 true，
-     * 将“是否继续”的决策权完全交给 LLM 在下一轮的 thinkAndDecide 中处理。
+     * 【优化核心】评估是否应该继续循环
+     * 移除了原来的 switch-case 业务逻辑判断。
+     * 现在只负责检测“系统级错误”。逻辑层面的“是否继续”完全交给 LLM 决定。
      */
-    private boolean evaluateShouldContinue(
-            List<Map<String, Object>> observations,
-            int iteration) {
-
-        // 检查是否有工具执行失败 (系统级错误)
+    private boolean evaluateShouldContinue(List<Map<String, Object>> observations, int iteration) {
+        // 检查是否有工具执行失败（Technical Failures）
         boolean hasError = observations.stream()
                 .anyMatch(obs -> {
                     Object result = obs.get("result");
@@ -404,40 +383,26 @@ public class ReActEngine {
                 });
 
         if (hasError) {
-            log.warn("检测到工具执行发生系统错误，为防止错误扩散，提前停止 ReAct 循环");
+            log.warn("检测到工具执行内部错误，为防止错误扩散，停止循环");
             return false;
         }
 
-        // 只要没有底层错误，就继续循环，让 LLM 看通过 observation 决定下一步
-        // (最大循环次数由外层 MAX_ITERATIONS 控制)
+        // 只要没有底层报错，就允许 LLM 继续思考。
+        // LLM 会根据 prompt 中的 "如果信息足够...请选择 final_answer" 来决定是否停止。
         return true;
     }
 
     /**
      * 从步骤中生成摘要
      */
-    private String generateSummaryFromSteps(
-            List<ReActStep> steps,
-            Map<String, Object> collectedData) {
-
+    private String generateSummaryFromSteps(List<ReActStep> steps, Map<String, Object> collectedData) {
         StringBuilder summary = new StringBuilder();
-
+        summary.append("基于分析过程的总结：\n");
         for (ReActStep step : steps) {
-            if (step.getStepNumber() > 0) {
-                if (step.getThought() != null) {
-                    // 简单总结每一步
-                    summary.append("- ").append(step.getThought()).append("\n");
-                }
+            if (step.getStepNumber() > 0 && step.getThought() != null) {
+                summary.append("- ").append(step.getThought()).append("\n");
             }
         }
-
-        if (collectedData.containsKey("rag_documents")) {
-            summary.append("\n(参考了内部知识库文档)");
-        }
-        if (collectedData.containsKey("web_search_results")) {
-            summary.append("\n(参考了网络搜索结果)");
-        }
-
         return summary.toString();
     }
 
@@ -453,116 +418,58 @@ public class ReActEngine {
             List<AgentResponse.RetrievedDocument> documents,
             Map<String, Object> collectedData) {
 
-        // 评估风险等级
-        String riskLevel = evaluateRiskLevel(scenario, documents, collectedData);
-
-        // 计算置信度
-        double confidence = calculateConfidence(steps, documents, collectedData);
+        // 简单的置信度计算
+        double confidence = 0.7;
+        if (documents != null && !documents.isEmpty()) confidence += 0.1;
+        if (collectedData.containsKey("web_search_results")) confidence += 0.1;
 
         return AgentResponse.builder()
                 .responseId("resp_react_" + UUID.randomUUID().toString())
                 .sessionId(sessionId)
                 .scenario(scenario)
                 .responseType(AgentResponse.ResponseType.ANALYSIS)
-                .coreLogic("基于ReAct动态编排分析")
+                .coreLogic("ReAct动态编排")
                 .detailedAnalysis(finalAnswer)
-                .riskLevel(riskLevel)
-                .confidence(confidence)
+                .riskLevel(evaluateRiskLevel(scenario, documents, collectedData))
+                .confidence(Math.min(confidence, 0.95))
                 .supportingDocuments(documents)
                 .metadata(Map.of(
                         "react_steps", steps.size(),
-                        "tool_calls", collectedData.keySet().stream()
-                                .filter(k -> k.startsWith("last_tool_"))
-                                .count(),
-                        "processing_time_ms", System.currentTimeMillis() -
-                                steps.get(0).getTimestamp().toInstant(java.time.ZoneOffset.UTC)
-                                        .toEpochMilli()
+                        "tool_calls", collectedData.keySet().stream().filter(k -> k.startsWith("last_tool_")).count()
                 ))
                 .generatedAt(LocalDateTime.now())
                 .build();
     }
 
-    /**
-     * 评估风险等级
-     */
-    private String evaluateRiskLevel(
-            String scenario,
-            List<AgentResponse.RetrievedDocument> documents,
-            Map<String, Object> collectedData) {
-        // 此处可结合 LLM 对 finalAnswer 进行情感分析来动态判定，暂时保持默认逻辑
-        return "MEDIUM";
+    private String evaluateRiskLevel(String scenario, List<AgentResponse.RetrievedDocument> docs, Map<String, Object> data) {
+        return "MEDIUM"; // 实际项目中应根据 LLM 分析结果动态设定
     }
 
-    /**
-     * 计算置信度
-     */
-    private double calculateConfidence(
-            List<ReActStep> steps,
-            List<AgentResponse.RetrievedDocument> documents,
-            Map<String, Object> collectedData) {
-
-        double baseConfidence = 0.7;
-
-        if (documents != null && !documents.isEmpty()) {
-            baseConfidence += 0.15;
-        }
-        if (collectedData.containsKey("web_search_results")) {
-            baseConfidence += 0.1;
-        }
-        // 步数越多不一定越好，适当的步数表示思考过程完整
-        if (steps.size() >= 2 && steps.size() <= 4) {
-            baseConfidence += 0.05;
-        }
-
-        return Math.min(baseConfidence, 0.95);
-    }
-
-    /**
-     * 创建错误响应
-     */
     private AgentResponse createErrorResponse(String sessionId, String userInput, String error) {
         return AgentResponse.builder()
-                .responseId("resp_error_" + UUID.randomUUID().toString())
+                .responseId("resp_err_" + UUID.randomUUID())
                 .sessionId(sessionId)
-                .scenario("系统错误")
-                .responseType(AgentResponse.ResponseType.ERROR)
-                .coreLogic("ReAct循环执行异常")
-                .detailedAnalysis("抱歉，智能体分析过程中遇到技术问题：" + error)
+                .scenario("ERROR")
+                .coreLogic("System Error")
+                .detailedAnalysis("系统处理请求时发生异常: " + error)
                 .riskLevel("UNKNOWN")
                 .confidence(0.0)
                 .generatedAt(LocalDateTime.now())
                 .build();
     }
 
-    /**
-     * 辅助方法：截断字符串
-     */
     private String truncateString(String str, int maxLength) {
         if (str == null) return "";
-        if (str.length() <= maxLength) {
-            return str;
-        }
-        return str.substring(0, maxLength) + "...(truncated)";
+        return str.length() <= maxLength ? str : str.substring(0, maxLength) + "...";
     }
 
-    /**
-     * 从响应中提取JSON
-     */
     private String extractJsonFromResponse(String response) {
         if (response == null) return "{}";
-
         int start = response.indexOf('{');
         int end = response.lastIndexOf('}');
-
         if (start != -1 && end != -1 && end > start) {
             return response.substring(start, end + 1);
         }
-
-        // 清理常见的 Markdown 标记
-        return response.replaceAll("^```json\\s*", "")
-                .replaceAll("\\s*```$", "")
-                .replaceAll("^```\\s*", "")
-                .replaceAll("\\s*```$", "")
-                .trim();
+        return response.replaceAll("```json", "").replaceAll("```", "").trim();
     }
 }
