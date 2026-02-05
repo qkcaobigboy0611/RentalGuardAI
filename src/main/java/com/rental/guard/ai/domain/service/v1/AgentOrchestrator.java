@@ -23,6 +23,14 @@ import java.util.concurrent.ThreadPoolExecutor;
 
 /**
  * 智能体编排器 - 协调各个组件处理用户请求
+ *
+ *
+ * 缺乏真正的“思考-行动”循环 (No ReAct Loop)
+ * 证据：目前的逻辑是线性的：Retrieve -> Generate -> Return。
+ *
+ * 风险：真正的智能体（Agent）应该具备 ReAct (Reason + Act) 能力。
+ * 即：模型决定调用工具 -> 执行工具 -> 观察结果 -> 再决定是否继续。
+ * 目前的实现是一次性把所有上下文丢进去，不支持多步工具调用（例如：先查天气，发现是雨天，再查打车软件）。
  */
 @Slf4j
 @Service
@@ -127,7 +135,6 @@ public class AgentOrchestrator {
                 String searchContent = searchFuture.get();
 
                 // 5. 调用MCP服务器
-
                 Map<String, Object> mcpResponse = mcpService.callMCPServer(sessionId, mcpContext);
 
                 // 6. 生成智能体响应
@@ -300,7 +307,7 @@ public class AgentOrchestrator {
         List<CompletableFuture<AgentResponse>> futures = new ArrayList<>();
 
         for (int i = 0; i < Math.min(sessionIds.size(), userInputs.size()); i++) {
-            futures.add(processRequest(sessionIds.get(i), userInputs.get(i), null));
+            futures.add(processRequestV2(sessionIds.get(i), userInputs.get(i), null));
         }
 
         return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
@@ -336,7 +343,7 @@ public class AgentOrchestrator {
                                          String sessionContext,
                                          String searchContent) {
         try {
-            // 构建增强提示
+            // 构建增强提示(不需要调用外部AI服务整理，一个是增加延迟，二是成本翻倍，三是信息丢失)
             String enhancedPrompt = buildEnhancedPrompt(userInput, scenario, ragResults, sessionContext, searchContent);
 
             Map<String, Object> responseMap = generateStructuredData(enhancedPrompt, Map.class);
@@ -365,6 +372,16 @@ public class AgentOrchestrator {
 
     /**
      * 构建增强提示
+     * @param userInput 用户输入
+     * @param scenario 场景
+     * @param ragResults rag结果
+     * @param sessionContext 会话
+     * @param searchContent 实时信息联网搜索
+     * @return
+     */
+    /**
+     * 构建增强提示 (Optimized Version - 中文版)
+     * 采用结构化 Prompt 设计 (XML Tags) + 强制 JSON 输出模式
      */
     private String buildEnhancedPrompt(String userInput, String scenario,
                                        List<com.rental.guard.ai.domain.dto.v1.AgentResponse.RetrievedDocument> ragResults,
@@ -372,41 +389,78 @@ public class AgentOrchestrator {
                                        String searchContent) {
         StringBuilder prompt = new StringBuilder();
 
-        prompt.append("请作为租房风险分析专家，分析以下情况：\n\n");
-        prompt.append("【用户问题】\n").append(userInput).append("\n\n");
-        prompt.append("【分析场景】\n").append(scenario).append("\n\n");
+        // 1. 系统角色与任务定义 (System Persona & Task)
+        // 翻译为中文设定，让模型更自然地输出中文回复
+        prompt.append("你是一位资深的租房防欺诈安全顾问。");
+        prompt.append("你的任务是严格基于提供的上下文数据，分析用户的查询是否存在潜在的租房欺诈风险。\n\n");
 
+        // 2. 注入上下文数据 (使用 XML 标签隔离，防止指令注入)
+        prompt.append("<context_data>\n");
+
+        // 2.1 场景信息
+        prompt.append("  <scenario>").append(scenario).append("</scenario>\n");
+
+        // 2.2 会话历史 (Session History)
         if (sessionContext != null && !sessionContext.isEmpty()) {
-            prompt.append("【会话上下文】\n").append(sessionContext).append("\n\n");
+            prompt.append("  <conversation_history>\n")
+                    .append(sessionContext)
+                    .append("\n  </conversation_history>\n");
         }
+
+        // 2.3 实时联网搜索信息 (Web Search)
         if (searchContent != null && !searchContent.isEmpty()) {
-            prompt.append("【实时信息(联网搜索)】\n").append(searchContent).append("\n\n");
+            prompt.append("  <web_search_results>\n")
+                    .append(searchContent)
+                    .append("\n  </web_search_results>\n");
         }
 
+        prompt.append("</context_data>\n\n");
+
+        // 3. 注入 RAG 知识库参考信息 (Knowledge Base)
         if (ragResults != null && !ragResults.isEmpty()) {
-            prompt.append("【参考信息】\n");
-            for (int i = 0; i < Math.min(ragResults.size(), 5); i++) {
+            prompt.append("<knowledge_base>\n");
+            // 限制数量，防止 Token 溢出，建议取 Top 3-5
+            int limit = Math.min(ragResults.size(), 5);
+            for (int i = 0; i < limit; i++) {
                 com.rental.guard.ai.domain.dto.v1.AgentResponse.RetrievedDocument doc = ragResults.get(i);
-                prompt.append(i + 1).append(". ")
-                        .append("来源：").append(doc.getSource()).append("\n")
-                        .append("内容：").append(doc.getContent()).append("\n")
-                        .append("相关度：").append(String.format("%.1f", doc.getRelevanceScore() * 100))
-                        .append("%\n\n");
+                prompt.append("  <document id=\"").append(i + 1).append("\">\n")
+                        .append("    <source>").append(doc.getSource()).append("</source>\n")
+                        // 移除换行符以保持 XML 结构整洁
+                        .append("    <content>").append(doc.getContent().replace("\n", " ")).append("</content>\n")
+                        .append("    <relevance>").append(String.format("%.2f", doc.getRelevanceScore())).append("</relevance>\n")
+                        .append("  </document>\n");
             }
+            prompt.append("</knowledge_base>\n\n");
         }
 
-        prompt.append("请生成包含以下字段的分析结果，提供：\n");
-        prompt.append("1. riskLevel : 风险等级评估（极高/高/中/低）\n");
-        prompt.append("2. coreLogic: 核心问题分析\n");
-        prompt.append("3. detailedAnalysis: 详细的风险说明\n");
-        prompt.append("4. keyFindings: 关键发现列表\n");
-        prompt.append("5. keyFindings: 关键发现列表\n");
-        prompt.append("6. recommendations:建议行动列表\n");
-        prompt.append("7. legalReferences: 相关法律依据\n");
-        prompt.append("8. confidence: 置信度（0-1之间)\n");
+        // 4. 用户当前输入 (User Input)
+        prompt.append("<user_query>\n")
+                .append(userInput)
+                .append("\n</user_query>\n\n");
+
+        // 5. 输出指令与格式要求 (Output Instruction)
+        prompt.append("### 分析指令\n");
+        prompt.append("1. 结合 <conversation_history>（对话历史）和 <knowledge_base>（知识库）对 <user_query> 进行深入分析。\n");
+        prompt.append("2. 识别具体的欺诈特征信号（例如：制造紧迫感、房屋细节模糊、异常的支付或转账要求）。\n");
+        prompt.append("3. 与提供的 <knowledge_base> 中的法律法规或案例进行交叉验证。\n");
+        prompt.append("4. 重要：必须基于事实证据而非猜测来判定 'riskLevel'（风险等级）。\n\n");
+
+        prompt.append("### 输出格式\n");
+        prompt.append("你必须返回合法的 JSON 格式结果。不要使用 markdown 代码块包裹。JSON 结构如下（请使用中文填写内容，但字段名保持英文）：\n");
+        prompt.append("{\n");
+        prompt.append("  \"riskLevel\": \"CRITICAL | HIGH | MEDIUM | LOW\",\n"); // 保持英文枚举以便代码解析
+        prompt.append("  \"confidence\": 0.0 到 1.0,\n");
+        prompt.append("  \"coreLogic\": \"对主要推理逻辑的简要总结\",\n");
+        prompt.append("  \"detailedAnalysis\": \"对发现的风险因素的详细分析说明\",\n");
+        prompt.append("  \"keyFindings\": [\"发现的关键点 1\", \"发现的关键点 2\"],\n");
+        prompt.append("  \"recommendations\": [\"可执行的建议或行动指南 1\", \"建议 2\"],\n");
+        prompt.append("  \"legalReferences\": [\"来自知识库的相关法律条款或依据\"],\n");
+        prompt.append("  \"missingInformation\": \"需要用户进一步补充或澄清的信息（如果没有则留空）\"\n");
+        prompt.append("}");
 
         return prompt.toString();
     }
+
 
     /**
      * 从响应中提取JSON

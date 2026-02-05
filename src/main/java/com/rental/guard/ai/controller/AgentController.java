@@ -6,6 +6,7 @@ package com.rental.guard.ai.controller;
 
 import com.rental.guard.ai.domain.dto.v1.AgentResponse;
 import com.rental.guard.ai.domain.service.v1.AgentOrchestrator;
+import com.rental.guard.ai.domain.service.v1.OptimizedAgentOrchestrator;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -26,6 +27,9 @@ public class AgentController {
 
     @Autowired
     private AgentOrchestrator agentOrchestrator;
+
+    @Autowired
+    private OptimizedAgentOrchestrator optimizedAgentOrchestrator;
 
     /**
      * 处理用户消息
@@ -48,7 +52,7 @@ public class AgentController {
                             .body(Map.of("error", "消息内容不能为空")));
         }
 
-        return agentOrchestrator.processRequestV2(sessionId, userInput, localPath)
+        return optimizedAgentOrchestrator.processRequestWithReAct(sessionId, userInput, localPath)
                 .thenApply(response -> {
                     Map<String, Object> result = new HashMap<>();
                     result.put("success", true);

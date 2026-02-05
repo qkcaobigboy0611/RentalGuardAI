@@ -27,7 +27,7 @@ public class AgentControllerTest {
     public void aa() {
         String sessionId = "test_session_123";
         String userInput = "合同里说断租不退押金，这合法吗？";
-        CompletableFuture<AgentResponse> agentResponseCompletableFuture = agentOrchestrator.processRequest(sessionId, userInput);
+        CompletableFuture<AgentResponse> agentResponseCompletableFuture = agentOrchestrator.processRequestV2(sessionId, userInput, null);
         System.out.println(agentResponseCompletableFuture);
     }
 
