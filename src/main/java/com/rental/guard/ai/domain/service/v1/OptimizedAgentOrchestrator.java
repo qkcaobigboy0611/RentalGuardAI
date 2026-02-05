@@ -44,6 +44,11 @@ public class OptimizedAgentOrchestrator {
     private ObjectMapper objectMapper;
     @Autowired
     private List<AgentTool> agentTools; // Spring会自动注入所有实现AgentTool的Bean
+    @Autowired
+    private LongTermMemoryService memoryService;
+    @Autowired
+    private SimpleKnowledgeGraphService kgService;
+
 
     private final ExecutorService executorService = Executors.newFixedThreadPool(15);
     private ReActEngine reActEngine;
@@ -51,8 +56,6 @@ public class OptimizedAgentOrchestrator {
 
     @Autowired
     public OptimizedAgentOrchestrator() {
-        // 注册场景处理器
-        registerScenarioHandlers();
     }
 
     @PostConstruct
@@ -61,8 +64,11 @@ public class OptimizedAgentOrchestrator {
         Map<String, AgentTool> toolMap = agentTools.stream()
                 .collect(Collectors.toMap(AgentTool::getName, tool -> tool));
 
-        this.reActEngine = new ReActEngine(llmService, objectMapper, toolMap);
+        this.reActEngine = new ReActEngine(llmService, objectMapper, toolMap, memoryService, kgService);
         log.info("初始化ReAct引擎，可用工具: {}", toolMap.keySet());
+
+        // 注册场景处理器
+        registerScenarioHandlers();
     }
 
     private void registerScenarioHandlers() {
@@ -74,15 +80,18 @@ public class OptimizedAgentOrchestrator {
 
     /**
      * 新的处理入口 - 支持ReAct循环
+     * 引入长期记忆管理器：负责维护用户的画像，记录用户的租房偏好（预算，地点）和历史风险记录
+     * 简易知识图谱服务：负责存储和查询实体关系（如：房东电话-》关联房源-》关联中介公司-》是否黑名单）
      */
     public CompletableFuture<AgentResponse> processRequestWithReAct(
             String sessionId,
             String userInput,
-            String localPath) {
+            String localPath,
+            String userId) {
 
         return CompletableFuture.supplyAsync(() -> {
             try {
-                // 1. 获取或创建会话
+                // 1. 获取或创建会话(引入长期记忆管理器和简易知识图谱服务)
                 SessionManager session = sessionRepository.getOrCreateSession(sessionId);
 
                 // 2. 处理图片输入（如果有）
@@ -101,7 +110,7 @@ public class OptimizedAgentOrchestrator {
 
                 // 5. 执行ReAct循环
                 AgentResponse response = reActEngine.executeReActLoop(
-                        sessionId, finalUserInput, session, scenario
+                        sessionId, finalUserInput, session, scenario, userId
                 ).join();
 
                 // 6. 应用场景特定处理
@@ -222,12 +231,13 @@ public class OptimizedAgentOrchestrator {
      */
     public CompletableFuture<List<AgentResponse>> batchProcessRequests(
             List<String> sessionIds,
-            List<String> userInputs) {
+            List<String> userInputs,
+            String userId) {
 
         List<CompletableFuture<AgentResponse>> futures = new ArrayList<>();
 
         for (int i = 0; i < Math.min(sessionIds.size(), userInputs.size()); i++) {
-            futures.add(processRequestWithReAct(sessionIds.get(i), userInputs.get(i), null));
+            futures.add(processRequestWithReAct(sessionIds.get(i), userInputs.get(i), null, userId));
         }
 
         return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
@@ -259,8 +269,8 @@ public class OptimizedAgentOrchestrator {
      * 向后兼容 - 保持原有接口
      */
     public CompletableFuture<AgentResponse> processRequestV2(
-            String sessionId, String userInput, String localPath) {
+            String sessionId, String userInput, String localPath, String userId) {
         // 可以调用新的ReAct方法，或保持原有逻辑
-        return processRequestWithReAct(sessionId, userInput, localPath);
+        return processRequestWithReAct(sessionId, userInput, localPath, userId);
     }
 }

@@ -44,7 +44,8 @@ public class AgentController {
             @RequestParam String sessionId,
             @RequestParam String userInput,
             @RequestParam Integer type,
-            @RequestParam String localPath) {
+            @RequestParam String localPath,
+            @RequestParam String userId) {
 
         if (userInput == null || userInput.trim().isEmpty()) {
             return CompletableFuture.completedFuture(
@@ -52,7 +53,7 @@ public class AgentController {
                             .body(Map.of("error", "消息内容不能为空")));
         }
 
-        return optimizedAgentOrchestrator.processRequestWithReAct(sessionId, userInput, localPath)
+        return optimizedAgentOrchestrator.processRequestWithReAct(sessionId, userInput, localPath, userId)
                 .thenApply(response -> {
                     Map<String, Object> result = new HashMap<>();
                     result.put("success", true);

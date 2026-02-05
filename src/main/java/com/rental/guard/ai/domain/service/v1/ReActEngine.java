@@ -11,11 +11,15 @@ import com.rental.guard.ai.domain.service.LLMService;
 import com.rental.guard.ai.domain.service.v1.tool.AgentTool;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+import static io.micrometer.common.util.StringUtils.truncate;
 
 /**
  * ReAct循环引擎 - 实现思考-行动循环
@@ -30,6 +34,8 @@ public class ReActEngine {
     private final LLMService llmService;
     private final ObjectMapper objectMapper;
     private final Map<String, AgentTool> availableTools;
+    private final LongTermMemoryService memoryService;
+    private final SimpleKnowledgeGraphService kgService;
 
     // ReAct循环配置
     private static final int MAX_ITERATIONS = 5;
@@ -52,10 +58,14 @@ public class ReActEngine {
     }
 
     public ReActEngine(LLMService llmService, ObjectMapper objectMapper,
-                       Map<String, AgentTool> availableTools) {
+                       Map<String, AgentTool> availableTools,
+                       LongTermMemoryService memoryService,
+                       SimpleKnowledgeGraphService kgService) {
         this.llmService = llmService;
         this.objectMapper = objectMapper;
         this.availableTools = availableTools;
+        this.memoryService = memoryService;
+        this.kgService = kgService;
     }
 
     /**
@@ -65,17 +75,43 @@ public class ReActEngine {
             String sessionId,
             String userInput,
             SessionManager session,
-            String scenario) {
+            String scenario,
+            String userId) {
 
         return CompletableFuture.supplyAsync(() -> {
             try {
+
+                // 0. 预加载上下文：获取记忆和风险检测（并行执行）
+                CompletableFuture<String> memoryFuture = CompletableFuture.supplyAsync(() ->
+                        memoryService.getUserMemoryContext(sessionId, userId)
+                );
+                CompletableFuture<RiskAssessment> riskFuture = CompletableFuture.supplyAsync(() ->
+                        kgService.assessRisk(userInput)
+                );
+                // 等待预加载完成
+                CompletableFuture.allOf(memoryFuture, riskFuture).join();
+                String memoryContext = memoryFuture.get();
+                RiskAssessment riskAssessment = riskFuture.get();
+                // 1. 构建增强的用户输入
+                String enhancedInput = buildEnhancedInput(userInput, memoryContext, riskAssessment);
+
+                // 2. 执行ReAct思考循环
                 List<ReActStep> steps = new ArrayList<>();
                 StringBuilder finalAnswer = new StringBuilder();
                 List<AgentResponse.RetrievedDocument> allDocuments = new ArrayList<>();
                 Map<String, Object> collectedData = new ConcurrentHashMap<>();
 
+                // 将风险检测结果存入收集数据
+                if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
+                    collectedData.put("risk_assessment", riskAssessment);
+                }
+
                 // 初始思考
                 String initialThought = "开始分析用户问题：" + userInput;
+                if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
+                    initialThought += "（检测到" + riskAssessment.getMatches().size() + "个风险实体）";
+                }
+
                 ReActStep currentStep = new ReActStep(0, initialThought);
                 steps.add(currentStep);
 
@@ -85,7 +121,7 @@ public class ReActEngine {
 
                     // 1. 思考阶段 - LLM决定下一步行动
                     String decision = thinkAndDecide(
-                            userInput,
+                            enhancedInput,
                             scenario,
                             steps,
                             collectedData,
@@ -196,11 +232,23 @@ public class ReActEngine {
                     }
                 }
 
-                // 构建最终响应
-                return buildFinalResponse(
-                        sessionId, userInput, scenario, steps,
-                        finalAnswer.toString(), allDocuments, collectedData
+                // 3. 构建最终响应（集成风险检测结果）
+                AgentResponse response = buildFinalResponse(
+                        sessionId, enhancedInput, scenario, steps,
+                        finalAnswer.toString(), allDocuments, collectedData,
+                        memoryContext, riskAssessment, userId
                 );
+
+                // 4. 异步更新记忆（不影响主流程）
+                if (session != null && session.getMessageHistory() != null) {
+                    CompletableFuture.runAsync(() ->
+                            memoryService.updateMemoryAsync(userId, session.getMessageHistory())
+                    ).exceptionally(e -> {
+                        log.warn("异步更新记忆失败", e);
+                        return null;
+                    });
+                }
+                return response;
 
             } catch (Exception e) {
                 log.error("ReAct循环执行失败", e);
@@ -243,25 +291,40 @@ public class ReActEngine {
 
         // 系统指令
         prompt.append("你是一个租房风险分析智能体。使用 ReAct（思考-行动）模式处理问题。\n\n");
+        prompt.append("请结合【用户画像】、【对话历史】和【已收集信息】，利用 ReAct 模式回答用户。\n\n");
 
-        // 当前状态
-        prompt.append("## 当前状态\n");
+        // --- Context Block 1: 短期状态 (Session Scope) ---
+        prompt.append("### 1. 当前会话状态\n");
         prompt.append("- 用户问题: ").append(userInput).append("\n");
         prompt.append("- 识别场景: ").append(scenario).append("\n");
-        prompt.append("- 当前步骤: ").append(steps.size()).append(" / ").append(MAX_ITERATIONS).append("\n\n");
+        prompt.append("- 当前轮次: ").append(steps.size()).append(" / ").append(MAX_ITERATIONS).append("\n\n");
 
-        // 已收集的信息 (做截断处理防止 Token 溢出)
+
+        // --- Context Block 2: 知识库/工具数据 ---
         if (!collectedData.isEmpty()) {
-            prompt.append("## 已收集的信息\n");
-            for (Map.Entry<String, Object> entry : collectedData.entrySet()) {
-                prompt.append("- ").append(entry.getKey()).append(": ")
-                        .append(truncateString(entry.getValue().toString(), 300))
-                        .append("\n");
+            prompt.append("### 2. 已获取的外部信息\n");
+            collectedData.forEach((k, v) ->
+                    prompt.append("- ").append(k).append(": ").append(truncate(v.toString(), 300)).append("\n")
+            );
+            prompt.append("\n");
+        }
+
+
+        // --- Context Block 3: 思考历史 ---
+        if (!steps.isEmpty()) {
+            prompt.append("### 3. 思考与行动历史\n");
+            for (ReActStep step : steps) {
+                prompt.append("Step ").append(step.getStepNumber()).append(":\n");
+                prompt.append("  Thought: ").append(step.getThought()).append("\n");
+                if (step.getAction() != null) {
+                    prompt.append("  Action: ").append(step.getAction()).append("\n");
+                    prompt.append("  Observation: ").append(truncate(String.valueOf(step.getObservation()), 200)).append("\n");
+                }
             }
             prompt.append("\n");
         }
 
-        // 可用的工具
+        // --- Context Block 4: 可用工具 ---
         prompt.append("## 可用的工具\n");
         for (Map.Entry<String, AgentTool> entry : availableTools.entrySet()) {
             prompt.append("- ").append(entry.getKey()).append(": ")
@@ -269,22 +332,6 @@ public class ReActEngine {
         }
         prompt.append("\n");
 
-        // 历史步骤回放
-        if (!steps.isEmpty()) {
-            prompt.append("## 历史思考与行动\n");
-            for (ReActStep step : steps) {
-                prompt.append("步骤 ").append(step.getStepNumber()).append(":\n");
-                prompt.append("- 思考: ").append(step.getThought()).append("\n");
-                if (step.getAction() != null) {
-                    prompt.append("- 行动: ").append(step.getAction()).append("\n");
-                    if (step.getObservation() != null) {
-                        prompt.append("- 观察结果: ").append(truncateString(
-                                step.getObservation().toString(), 200)).append("\n");
-                    }
-                }
-                prompt.append("\n");
-            }
-        }
 
         // 【优化核心】决策指令
         prompt.append("## 决策策略（重要）\n");
@@ -359,6 +406,9 @@ public class ReActEngine {
                     case "conversation_analysis":
                         collectedData.put("conversation_analysis", resultMap.get("analysis_result"));
                         break;
+                    case "risk_assessment":
+                        collectedData.put("detailed_risk_assessment", resultMap.get("assessment_result"));
+                        break;
                 }
             }
             // 记录该工具已调用，避免 LLM 重复调用
@@ -403,56 +453,120 @@ public class ReActEngine {
                 summary.append("- ").append(step.getThought()).append("\n");
             }
         }
+
+        // 如果有风险检测结果，添加到摘要
+        if (collectedData.containsKey("risk_assessment")) {
+            RiskAssessment riskAssessment = (RiskAssessment) collectedData.get("risk_assessment");
+            if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
+                summary.append("\n风险检测发现：\n");
+                riskAssessment.getMatches().forEach(match -> {
+                    summary.append("- ").append(match.getExtractedEntity().getText())
+                            .append(" (").append(match.getRiskLevel()).append(")\n");
+                });
+            }
+        }
+
         return summary.toString();
     }
 
     /**
-     * 构建最终响应
+     * 构建最终响应（集成记忆和风险检测）
      */
     private AgentResponse buildFinalResponse(
             String sessionId,
-            String userInput,
+            String enhancedInput,
             String scenario,
             List<ReActStep> steps,
             String finalAnswer,
             List<AgentResponse.RetrievedDocument> documents,
-            Map<String, Object> collectedData) {
+            Map<String, Object> collectedData,
+            String memoryContext,
+            RiskAssessment riskAssessment,
+            String userId) {
 
-        // 简单的置信度计算
-        double confidence = 0.7;
-        if (documents != null && !documents.isEmpty()) confidence += 0.1;
-        if (collectedData.containsKey("web_search_results")) confidence += 0.1;
+        // 1. 计算置信度
+        double confidence = calculateConfidence(documents, collectedData, riskAssessment);
 
+        // 2. 评估风险等级（考虑知识图谱风险）
+        String riskLevel = evaluateRiskLevel(scenario, documents, collectedData, riskAssessment);
+
+        // 3. 构建元数据（包含记忆和风险信息）
+        Map<String, Object> metadata = buildMetadata(steps, collectedData, riskAssessment, memoryContext);
+
+        // 4. 构建详细分析（集成风险警告）
+        String detailedAnalysis = buildDetailedAnalysis(finalAnswer, riskAssessment);
+
+        // 5. 创建响应
         return AgentResponse.builder()
                 .responseId("resp_react_" + UUID.randomUUID().toString())
                 .sessionId(sessionId)
                 .scenario(scenario)
                 .responseType(AgentResponse.ResponseType.ANALYSIS)
-                .coreLogic("ReAct动态编排")
-                .detailedAnalysis(finalAnswer)
-                .riskLevel(evaluateRiskLevel(scenario, documents, collectedData))
+                .coreLogic("ReAct动态编排 + 记忆增强 + 风险检测")
+                .detailedAnalysis(detailedAnalysis)
+                .riskLevel(riskLevel)
                 .confidence(Math.min(confidence, 0.95))
                 .supportingDocuments(documents)
-                .metadata(Map.of(
-                        "react_steps", steps.size(),
-                        "tool_calls", collectedData.keySet().stream().filter(k -> k.startsWith("last_tool_")).count()
-                ))
+                .metadata(metadata)
                 .generatedAt(LocalDateTime.now())
                 .build();
     }
 
-    private String evaluateRiskLevel(String scenario, List<AgentResponse.RetrievedDocument> docs, Map<String, Object> data) {
-        return "MEDIUM"; // 实际项目中应根据 LLM 分析结果动态设定
+
+    /**
+     * 评估风险等级（集成知识图谱风险）
+     */
+    private String evaluateRiskLevel(String scenario,
+                                     List<AgentResponse.RetrievedDocument> documents,
+                                     Map<String, Object> collectedData,
+                                     RiskAssessment riskAssessment) {
+
+        String baseRiskLevel = "MEDIUM";
+
+        // 1. 检查知识图谱风险
+        if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
+            String highestRisk = riskAssessment.getHighestRiskLevel();
+            if ("CRITICAL".equals(highestRisk) || "HIGH".equals(highestRisk)) {
+                return highestRisk;
+            }
+
+            double riskScore = riskAssessment.getRiskScore();
+            if (riskScore > 0.8) {
+                return "HIGH";
+            } else if (riskScore > 0.5) {
+                return "MEDIUM";
+            }
+        }
+        // 2. 根据场景调整
+        switch (scenario) {
+            case "霸王条款":
+            case "距离欺诈":
+                baseRiskLevel = "MEDIUM";
+                break;
+            case "租金欺诈":
+                baseRiskLevel = "HIGH";
+                break;
+            case "合同审核":
+                baseRiskLevel = "MEDIUM";
+                break;
+        }
+
+        return baseRiskLevel;
     }
 
+
+    /**
+     * 创建错误响应
+     */
     private AgentResponse createErrorResponse(String sessionId, String userInput, String error) {
         return AgentResponse.builder()
-                .responseId("resp_err_" + UUID.randomUUID())
+                .responseId("resp_err_" + UUID.randomUUID().toString())
                 .sessionId(sessionId)
-                .scenario("ERROR")
-                .coreLogic("System Error")
-                .detailedAnalysis("系统处理请求时发生异常: " + error)
-                .riskLevel("UNKNOWN")
+                .scenario("系统错误")
+                .responseType(AgentResponse.ResponseType.ERROR)
+                .coreLogic("系统处理请求时发生错误")
+                .detailedAnalysis("错误信息：" + error + "\n建议稍后重试或联系技术支持")
+                .riskLevel("未知")
                 .confidence(0.0)
                 .generatedAt(LocalDateTime.now())
                 .build();
@@ -471,5 +585,170 @@ public class ReActEngine {
             return response.substring(start, end + 1);
         }
         return response.replaceAll("```json", "").replaceAll("```", "").trim();
+    }
+
+    /**
+     * 构建增强的用户输入（集成记忆和风险检测）
+     */
+    private String buildEnhancedInput(String originalInput,
+                                      String memoryContext,
+                                      RiskAssessment riskAssessment) {
+
+        StringBuilder enhanced = new StringBuilder();
+
+        // 1. 系统角色
+        enhanced.append("你是一个具备记忆能力和风险检测能力的租房风险分析智能体。\n\n");
+
+        // 2. 添加记忆上下文
+        if (StringUtils.isNotBlank(memoryContext)) {
+            enhanced.append("【用户历史与偏好】\n")
+                    .append(memoryContext)
+                    .append("\n\n");
+        } else {
+            enhanced.append("【用户历史与偏好】\n（新用户，暂无历史记录）\n\n");
+        }
+
+        // 3. 添加风险警告（如果检测到风险实体）
+        if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
+            enhanced.append("【风险预警】\n");
+            enhanced.append("系统检测到以下风险实体（请在你的分析中考虑这些风险）：\n");
+
+            riskAssessment.getMatches().forEach(match -> {
+                enhanced.append("- ").append(match.getExtractedEntity().getText())
+                        .append(" (").append(match.getKgEntity().getEntityType()).append(")")
+                        .append(" - 风险等级：").append(match.getRiskLevel())
+                        .append("，相似度：").append(String.format("%.1f", match.getSimilarity()))
+                        .append("\n");
+
+                if (StringUtils.isNotBlank(match.getKgEntity().getDescription())) {
+                    enhanced.append("  描述：").append(match.getKgEntity().getDescription()).append("\n");
+                }
+            });
+            enhanced.append("\n");
+        }
+
+        // 4. 添加原始输入
+        enhanced.append("【当前问题】\n")
+                .append(originalInput);
+
+        return enhanced.toString();
+    }
+
+    /**
+     * 计算置信度（考虑记忆和风险因素）
+     */
+    private double calculateConfidence(List<AgentResponse.RetrievedDocument> documents,
+                                       Map<String, Object> collectedData,
+                                       RiskAssessment riskAssessment) {
+        double baseConfidence = 0.7;
+
+        if (documents != null && !documents.isEmpty()) {
+            baseConfidence += 0.1;
+        }
+
+        if (collectedData.containsKey("web_search_results")) {
+            baseConfidence += 0.1;
+        }
+
+        if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
+            // 有风险检测结果会增加置信度
+            baseConfidence += 0.05;
+        }
+
+        // 如果有记忆上下文，增加个性化置信度
+        if (collectedData.containsKey("memory_context_used")) {
+            baseConfidence += 0.05;
+        }
+
+        return Math.min(baseConfidence, 0.95);
+    }
+
+    /**
+     * 构建元数据
+     */
+    private Map<String, Object> buildMetadata(List<ReActStep> steps,
+                                              Map<String, Object> collectedData,
+                                              RiskAssessment riskAssessment,
+                                              String memoryContext) {
+
+        Map<String, Object> metadata = new HashMap<>();
+
+        // ReAct过程信息
+        metadata.put("react_steps", steps.size());
+        metadata.put("tool_calls", collectedData.keySet().stream()
+                .filter(k -> k.startsWith("last_tool_"))
+                .count());
+
+        // 记忆信息
+        metadata.put("memory_context_used", StringUtils.isNotBlank(memoryContext));
+        if (StringUtils.isNotBlank(memoryContext)) {
+            metadata.put("memory_context_length", memoryContext.length());
+        }
+
+        // 风险检测信息
+        if (riskAssessment != null) {
+            metadata.put("risk_assessment", Map.of(
+                    "has_risks", !riskAssessment.getMatches().isEmpty(),
+                    "highest_risk_level", riskAssessment.getHighestRiskLevel(),
+                    "risk_score", riskAssessment.getRiskScore(),
+                    "matched_entities_count", riskAssessment.getMatches().size(),
+                    "risk_entities", riskAssessment.getMatches().stream()
+                            .map(match -> Map.of(
+                                    "entity", match.getExtractedEntity().getText(),
+                                    "type", match.getKgEntity().getEntityType(),
+                                    "risk_level", match.getRiskLevel()
+                            ))
+                            .collect(Collectors.toList())
+            ));
+        }
+
+        // 处理时间
+        if (!steps.isEmpty()) {
+            long processingTime = steps.stream()
+                    .mapToLong(step -> step.getTimestamp().toEpochSecond(java.time.ZoneOffset.UTC))
+                    .max()
+                    .orElse(0) -
+                    steps.get(0).getTimestamp().toEpochSecond(java.time.ZoneOffset.UTC);
+            metadata.put("processing_time_seconds", processingTime);
+        }
+
+        return metadata;
+    }
+
+    /**
+     * 构建详细分析（集成风险警告）
+     */
+    private String buildDetailedAnalysis(String baseAnalysis, RiskAssessment riskAssessment) {
+        if (riskAssessment == null || riskAssessment.getMatches().isEmpty()) {
+            return baseAnalysis;
+        }
+
+        StringBuilder enhanced = new StringBuilder(baseAnalysis);
+        enhanced.append("\n\n--- 风险检测报告 ---\n");
+        enhanced.append("⚠️ 智能风险检测系统发现以下风险实体：\n\n");
+
+        riskAssessment.getMatches().forEach(match -> {
+            enhanced.append("### ").append(match.getExtractedEntity().getText()).append("\n");
+            enhanced.append("- **类型**：").append(match.getKgEntity().getEntityType()).append("\n");
+            enhanced.append("- **风险等级**：").append(match.getRiskLevel()).append("\n");
+
+            if (StringUtils.isNotBlank(match.getKgEntity().getDescription())) {
+                enhanced.append("- **风险描述**：").append(match.getKgEntity().getDescription()).append("\n");
+            }
+
+            if (match.getKgEntity().getReportCount() > 0) {
+                enhanced.append("- **举报次数**：").append(match.getKgEntity().getReportCount()).append("次\n");
+            }
+            enhanced.append("- **置信度**：").append(String.format("%.1f", match.getSimilarity() * 100)).append("%\n");
+            enhanced.append("\n");
+        });
+
+        enhanced.append("💡 **建议**：在租房过程中，请特别注意以上提到的风险实体，建议：\n");
+        enhanced.append("1. 要求中介或房东提供更多验证信息\n");
+        enhanced.append("2. 在签约前实地考察房源\n");
+        enhanced.append("3. 仔细核对合同条款\n");
+        enhanced.append("4. 如有疑问，建议咨询专业律师\n");
+
+        return enhanced.toString();
     }
 }

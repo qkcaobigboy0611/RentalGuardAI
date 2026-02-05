@@ -4,6 +4,8 @@
  */
 package com.rental.guard.ai.domain.service.v1;
 
+import com.alibaba.dashscope.exception.NoApiKeyException;
+import com.alibaba.dashscope.exception.UploadFileException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rental.guard.ai.domain.dto.v1.AgentResponse;
 import com.rental.guard.ai.domain.dto.v1.Message;
@@ -14,6 +16,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -83,20 +86,8 @@ public class AgentOrchestrator {
                 // 1. 获取或创建会话
                 SessionManager session = sessionRepository.getOrCreateSession(sessionId);
 
-                String finalUserInput = null;
-                // 2.如果是照片的话
-                if(StringUtils.isNotEmpty(localPath)) {
-                    String s = llmService.simpleMultiModalConversationCall(localPath);
-                    // 方案1.3：结构化拼接（推荐）
-                    finalUserInput = String.format("""
-                    用户输入：%s
-                    图片分析结果：
-                    %s
-                    请基于以上信息回答问题。
-                    """, userInput, s);
-                } else {
-                    finalUserInput = userInput;
-                }
+                // 2. 处理图片输入（如果有）
+                String finalUserInput = processImageInput(userInput, localPath);
 
                 // 2. 保存用户消息
                 Message userMessage = Message.createUserMessage(sessionId, finalUserInput);
@@ -534,6 +525,24 @@ public class AgentOrchestrator {
             log.error("LLM结构化数据生成失败", e);
             return null;
         }
+    }
+
+    public String processImageInput(String userInput, String localPath) throws NoApiKeyException, UploadFileException, IOException {
+        String finalUserInput = null;
+        // 2.如果是照片的话
+        if(StringUtils.isNotEmpty(localPath)) {
+            String s = llmService.simpleMultiModalConversationCall(localPath);
+            // 方案1.3：结构化拼接（推荐）
+            finalUserInput = String.format("""
+                    用户输入：%s
+                    图片分析结果：
+                    %s
+                    请基于以上信息回答问题。
+                    """, userInput, s);
+        } else {
+            finalUserInput = userInput;
+        }
+        return finalUserInput;
     }
 }
 

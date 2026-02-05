@@ -124,3 +124,36 @@ escalation:
     enabled: true
     max-wait-time: 120
     notification-url: "https://internal-support/api/notify"
+
+
+# application.yml
+memory:
+  # 长期记忆配置
+  long-term:
+    enabled: true
+    cache-ttl: 3600  # 1小时
+    max-memories-per-user: 100
+
+  # 知识图谱配置
+  knowledge-graph:
+    enabled: true
+    risk-thresholds:
+      high: 0.8
+      medium: 0.5
+      low: 0.3
+
+    # 实体提取配置
+    entity-extraction:
+      enabled: true
+      phone-pattern: "1[3-9]\\d{9}"
+      address-keywords: ["路", "街", "巷", "小区", "大厦", "公寓", "号"]
+      agency-keywords: ["链家", "我爱我家", "中原", "贝壳", "安居客", "房天下"]
+
+  # 缓存配置
+  cache:
+    caffeine:
+      max-size: 1000
+      expire-after-write: 600  # 10分钟
+    redis:
+      enabled: true
+      ttl: 3600  # 1小时
