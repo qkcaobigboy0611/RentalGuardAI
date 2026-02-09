@@ -16,8 +16,6 @@ import com.rental.guard.ai.infrastructure.po.PoFraudDetectionRecord;
 import com.rental.guard.ai.infrastructure.po.PoFraudTrainingCase;
 import com.rental.guard.ai.infrastructure.po.PoMessage;
 import com.rental.guard.ai.infrastructure.service.CaseRanker;
-import com.rental.guard.ai.infrastructure.service.TrainingCaseRetriever;
-import com.rental.guard.ai.infrastructure.service.VectorSearchService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpEntity;
@@ -30,7 +28,6 @@ import org.springframework.web.client.RestTemplate;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
@@ -52,12 +49,6 @@ public class FraudDetectionServiceImpl implements FraudDetectionService {
     private MessageMapper messageMapper;
     @Autowired
     private ArgConfig argConfig;
-    @Autowired
-    private VectorSearchService vectorSearchService;
-    @Autowired
-    private TrainingCaseRetriever trainingCaseRetriever;
-    @Autowired
-    private CaseRanker caseRanker;
 
 
     @Override
