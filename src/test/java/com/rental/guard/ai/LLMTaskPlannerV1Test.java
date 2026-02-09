@@ -4,7 +4,6 @@
  */
 package com.rental.guard.ai;
 
-import com.rental.guard.ai.domain.service.FraudDetectionService;
 import com.rental.guard.ai.domain.service.v1.AgentResponseNo;
 import com.rental.guard.ai.domain.service.v1.RentalFraudAIAgent;
 import lombok.extern.slf4j.Slf4j;
@@ -17,8 +16,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 public class LLMTaskPlannerV1Test {
     @Autowired
     private RentalFraudAIAgent rentalFraudAIAgent;
-    @Autowired
-    private FraudDetectionService fraudDetectionService;
 
     @Test
     void testComplexInvestigationPlanning() {
