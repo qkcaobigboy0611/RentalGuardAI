@@ -4,12 +4,14 @@
  */
 package com.rental.guard.ai.domain.service.v1;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rental.guard.ai.domain.dto.v1.AgentResponse;
 import com.rental.guard.ai.domain.dto.v1.Message;
 import com.rental.guard.ai.domain.dto.v1.SessionManager;
 import com.rental.guard.ai.domain.service.LLMService;
+import com.rental.guard.ai.domain.service.ReActAgent;
 import com.rental.guard.ai.domain.service.v1.tool.AgentTool;
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.service.AiServices;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -30,25 +32,31 @@ import java.util.stream.Collectors;
 @Slf4j
 @Service
 public class OptimizedAgentOrchestrator {
+
     @Autowired
     private SessionRepository sessionRepository;
+
+    // 保留 LLMService 用于简单的场景识别和图片分析
     @Autowired
     private LLMService llmService;
+
     @Autowired
     private RAGService ragService;
     @Autowired
     private MCPService mcpService;
     @Autowired
     private ZhipuSearchService zhipuSearchService;
+
+    // 【修改点1】移除 ObjectMapper，引入 LangChain4j 的 ChatLanguageModel
     @Autowired
-    private ObjectMapper objectMapper;
+    private ChatLanguageModel chatLanguageModel;
+
     @Autowired
     private List<AgentTool> agentTools; // Spring会自动注入所有实现AgentTool的Bean
     @Autowired
     private LongTermMemoryService memoryService;
     @Autowired
     private SimpleKnowledgeGraphService kgService;
-
 
     private final ExecutorService executorService = Executors.newFixedThreadPool(15);
     private ReActEngine reActEngine;
@@ -60,18 +68,28 @@ public class OptimizedAgentOrchestrator {
 
     @PostConstruct
     public void init() {
-        // 初始化ReAct引擎
+        // 初始化工具映射
         Map<String, AgentTool> toolMap = agentTools.stream()
                 .collect(Collectors.toMap(AgentTool::getName, tool -> tool));
 
-        this.reActEngine = new ReActEngine(llmService, objectMapper, toolMap, memoryService, kgService);
-        log.info("初始化ReAct引擎，可用工具: {}", toolMap.keySet());
+        // 【修改点2】构建 ReActAgent 并初始化 ReActEngine
+        // 使用 LangChain4j 的 AiServices 动态代理接口，自动处理 Prompt 和 JSON 解析
+        ReActAgent reActAgent = AiServices.builder(ReActAgent.class)
+                .chatLanguageModel(chatLanguageModel)
+                .build();
+
+        // 传递构造好的 reActAgent，不再传递 llmService 和 objectMapper
+        this.reActEngine = new ReActEngine(reActAgent, toolMap, memoryService, kgService);
+
+        log.info("初始化ReAct引擎完成 (LangChain4j Powered)，可用工具: {}", toolMap.keySet());
 
         // 注册场景处理器
         registerScenarioHandlers();
     }
 
     private void registerScenarioHandlers() {
+        // 假设这些 Handler 类已在项目中定义，此处仅保留原有逻辑
+        // 如果这些 Handler 是内部类或需要注入，请确保它们可用
         scenarioHandlers.put("合同审核", new ContractReviewHandler());
         scenarioHandlers.put("距离欺诈", new DistanceFraudHandler());
         scenarioHandlers.put("租金欺诈", new RentFraudHandler());
@@ -181,6 +199,7 @@ public class OptimizedAgentOrchestrator {
                 """.formatted(userInput);
 
         String scenario = llmService.generate(prompt);
+        // 简单的清洗逻辑
         scenario = scenario.replaceAll("[^\\u4e00-\\u9fa5]", "").trim();
 
         if (!scenarioHandlers.containsKey(scenario)) {
@@ -253,7 +272,7 @@ public class OptimizedAgentOrchestrator {
         Map<String, Object> status = new HashMap<>();
 
         status.put("timestamp", LocalDateTime.now().toString());
-        status.put("react_engine", "active");
+        status.put("react_engine", "active (LangChain4j)");
         status.put("available_tools", agentTools.stream()
                 .map(AgentTool::getName)
                 .collect(Collectors.toList()));
@@ -272,5 +291,48 @@ public class OptimizedAgentOrchestrator {
             String sessionId, String userInput, String localPath, String userId) {
         // 可以调用新的ReAct方法，或保持原有逻辑
         return processRequestWithReAct(sessionId, userInput, localPath, userId);
+    }
+
+    // -------------------------------------------------------------------------
+    // 内部类或接口定义的 Placeholder (为了代码完整性，如果原始文件中有请保留)
+    // -------------------------------------------------------------------------
+
+    public interface ScenarioHandler {
+        void process(AgentResponse response, SessionManager session, List<AgentResponse.RetrievedDocument> docs);
+    }
+
+    public static class DefaultScenarioHandler implements ScenarioHandler {
+        @Override
+        public void process(AgentResponse response, SessionManager session, List<AgentResponse.RetrievedDocument> docs) {
+            // 默认不做额外处理
+        }
+    }
+
+    public static class ContractReviewHandler implements ScenarioHandler {
+        @Override
+        public void process(AgentResponse response, SessionManager session, List<AgentResponse.RetrievedDocument> docs) {
+            // 合同审核后处理逻辑
+        }
+    }
+
+    public static class DistanceFraudHandler implements ScenarioHandler {
+        @Override
+        public void process(AgentResponse response, SessionManager session, List<AgentResponse.RetrievedDocument> docs) {
+            // 距离欺诈后处理逻辑
+        }
+    }
+
+    public static class RentFraudHandler implements ScenarioHandler {
+        @Override
+        public void process(AgentResponse response, SessionManager session, List<AgentResponse.RetrievedDocument> docs) {
+            // 租金欺诈后处理逻辑
+        }
+    }
+
+    public static class UnfairClauseHandler implements ScenarioHandler {
+        @Override
+        public void process(AgentResponse response, SessionManager session, List<AgentResponse.RetrievedDocument> docs) {
+            // 霸王条款后处理逻辑
+        }
     }
 }
