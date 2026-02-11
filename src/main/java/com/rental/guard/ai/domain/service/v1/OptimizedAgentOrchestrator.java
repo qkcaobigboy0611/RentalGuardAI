@@ -125,9 +125,36 @@ public class OptimizedAgentOrchestrator {
 
                 log.info("开始ReAct处理 - 会话: {}, 场景: {}", sessionId, scenario);
 
-                // 5. 执行ReAct循环
+                // 【优化点】并行执行：RAG检索 + MCP上下文构建 + 联网搜索
+                // 1) 实时搜索数据
+                CompletableFuture<String> searchFuture = CompletableFuture
+                        .supplyAsync(() -> zhipuSearchService.searchInternetAsync(finalUserInput, scenario), executorService);
+
+                // 2) RAG 知识库检索（包含查询增强）
+                CompletableFuture<List<AgentResponse.RetrievedDocument>> ragFuture = CompletableFuture
+                        .supplyAsync(() -> ragService.retrieveRelevantDocuments(
+                                ragService.enhanceQuery(finalUserInput, scenario), scenario), executorService);
+
+                // 3) MCP 上下文构建
+                CompletableFuture<Map<String, Object>> mcpContextFuture = CompletableFuture
+                        .supplyAsync(() -> mcpService.buildModelContext(
+                                sessionId, session.getMessageHistory(), scenario, null), executorService);
+
+                // 等待所有并行任务完成
+                CompletableFuture.allOf(searchFuture, ragFuture, mcpContextFuture).join();
+
+                String searchContent = searchFuture.get();
+                List<AgentResponse.RetrievedDocument> ragResults = ragFuture.get();
+                Map<String, Object> mcpContext = mcpContextFuture.get();
+
+                // 5. 调用 MCP 服务器获取增强背景
+                Map<String, Object> mcpResponse = mcpService.callMCPServer(sessionId, mcpContext);
+
+                // 6. 执行 ReAct 循环 (注入预先获取的上下文，显著提升首轮思考质量)
+                // 注意：ReActEngine 的 executeReActLoop 已优化为接受这些增强数据
                 AgentResponse response = reActEngine.executeReActLoop(
-                        sessionId, finalUserInput, session, scenario, userId
+                        sessionId, finalUserInput, session, scenario, userId,
+                        ragResults, searchContent, mcpResponse
                 ).join();
 
                 // 6. 应用场景特定处理
@@ -156,6 +183,7 @@ public class OptimizedAgentOrchestrator {
             }
         }, executorService);
     }
+
 
     /**
      * 处理图片输入
@@ -283,14 +311,6 @@ public class OptimizedAgentOrchestrator {
         return status;
     }
 
-    /**
-     * 向后兼容 - 保持原有接口
-     */
-    public CompletableFuture<AgentResponse> processRequestV2(
-            String sessionId, String userInput, String localPath, String userId) {
-        // 可以调用新的ReAct方法，或保持原有逻辑
-        return processRequestWithReAct(sessionId, userInput, localPath, userId);
-    }
 
     // -------------------------------------------------------------------------
     // 内部类或接口定义的 Placeholder (为了代码完整性，如果原始文件中有请保留)

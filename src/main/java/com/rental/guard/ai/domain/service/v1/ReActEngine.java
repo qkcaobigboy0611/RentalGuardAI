@@ -249,6 +249,205 @@ public class ReActEngine {
         });
     }
 
+
+    /**
+     * 执行增强版的 ReAct 循环 - 支持预取数据的注入
+     * * @param preFetchedDocs  预取的 RAG 文档
+     * @param searchContent   预取的联网搜索结果
+     * @param mcpResponse     预取的 MCP 服务器响应
+     */
+    public CompletableFuture<AgentResponse> executeReActLoop(
+            String sessionId,
+            String userInput,
+            SessionManager session,
+            String scenario,
+            String userId,
+            List<AgentResponse.RetrievedDocument> preFetchedDocs,
+            String searchContent,
+            Map<String, Object> mcpResponse) {
+
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                // 1. 预加载核心上下文：记忆和实时风险实体检测 (并行执行)
+                CompletableFuture<String> memoryFuture = CompletableFuture.supplyAsync(() ->
+                        memoryService.getUserMemoryContext(sessionId, userId)
+                );
+                CompletableFuture<RiskAssessment> riskFuture = CompletableFuture.supplyAsync(() ->
+                        kgService.assessRisk(userInput)
+                );
+
+                CompletableFuture.allOf(memoryFuture, riskFuture).join();
+                String memoryContext = memoryFuture.get();
+                RiskAssessment riskAssessment = riskFuture.get();
+
+                // 2. 初始化 ReAct 状态机容器
+                List<ReActStep> steps = new ArrayList<>();
+                StringBuilder finalAnswer = new StringBuilder();
+                List<AgentResponse.RetrievedDocument> allDocuments = new ArrayList<>(preFetchedDocs != null ? preFetchedDocs : Collections.emptyList());
+                Map<String, Object> collectedData = new ConcurrentHashMap<>();
+
+                // --- 注入预取数据到 Knowledge Base ---
+                if (preFetchedDocs != null && !preFetchedDocs.isEmpty()) {
+                    collectedData.put("rag_documents", preFetchedDocs);
+                    collectedData.put("last_tool_rag_retrieval", System.currentTimeMillis());
+                }
+                if (StringUtils.isNotBlank(searchContent)) {
+                    collectedData.put("web_search_results", searchContent);
+                    collectedData.put("last_tool_web_search", System.currentTimeMillis());
+                }
+                if (mcpResponse != null && !mcpResponse.isEmpty()) {
+                    collectedData.put("mcp_context", mcpResponse);
+                    collectedData.put("last_tool_mcp_call", System.currentTimeMillis());
+                }
+                if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
+                    collectedData.put("risk_assessment", riskAssessment);
+                }
+
+                // 3. 构建增强的用户输入 (注入用户偏好、长期记忆和初步风险提示)
+                String enhancedInput = buildEnhancedInput(userInput, memoryContext, riskAssessment);
+
+                // 4. 初始思考步骤记录
+                String initialThought = "系统已预加载上下文信息（包含记忆、风险检测及相关文档）。开始针对场景 [" + scenario + "] 进行深度分析。";
+                steps.add(new ReActStep(0, initialThought));
+
+                // 5. ReAct 循环主体
+                for (int iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
+                    log.info("ReAct 迭代 [{}/{}] 会话: {}", iteration, MAX_ITERATIONS, sessionId);
+
+                    // --- 阶段 A: 思考 (Think) ---
+                    // 调用 ReActAgent (LangChain4j Service) 获取结构化决策
+                    AgentDecision decision = thinkAndDecide(
+                            enhancedInput,
+                            scenario,
+                            steps,
+                            collectedData
+                    );
+
+                    String actionType = decision.getAction();
+                    String reasoning = decision.getReasoning();
+
+                    // 记录当前步骤的思考
+                    ReActStep currentStep = new ReActStep(iteration, reasoning);
+                    currentStep.setAction(actionType);
+                    steps.add(currentStep);
+
+                    // --- 阶段 B: 行动 (Act) ---
+                    if ("final_answer".equals(actionType)) {
+                        // 结束条件：模型认为信息已足够
+                        String answer = decision.getAnswer();
+                        finalAnswer.append(StringUtils.defaultIfBlank(answer, reasoning));
+                        log.info("智能体达成共识，生成最终答案。");
+                        break;
+
+                    } else if ("tool_call".equals(actionType)) {
+                        // 行动：调用外部工具补充缺失信息
+                        List<AgentDecision.ToolCallRequest> toolCalls = decision.getToolCalls();
+                        if (toolCalls == null || toolCalls.isEmpty()) {
+                            log.warn("检测到空工具调用指令，强制中断以防止死循环");
+                            break;
+                        }
+
+                        // 并行执行本轮次的工具调用
+                        List<CompletableFuture<Map<String, Object>>> toolFutures = new ArrayList<>();
+                        int callsInThisStep = Math.min(toolCalls.size(), MAX_TOOL_CALLS_PER_STEP);
+
+                        for (int i = 0; i < callsInThisStep; i++) {
+                            AgentDecision.ToolCallRequest toolCall = toolCalls.get(i);
+                            toolFutures.add(executeSingleTool(toolCall, session));
+                        }
+
+                        CompletableFuture.allOf(toolFutures.toArray(new CompletableFuture[0])).join();
+
+                        // --- 阶段 C: 观察 (Observe) ---
+                        List<Map<String, Object>> observations = new ArrayList<>();
+                        for (CompletableFuture<Map<String, Object>> future : toolFutures) {
+                            observations.add(future.join());
+                        }
+
+                        currentStep.setObservation(observations);
+
+                        // 更新全局知识库和支持文档
+                        processToolResults(observations, collectedData, allDocuments);
+
+                        // 错误检查与熔断
+                        if (!evaluateShouldContinue(observations)) {
+                            finalAnswer.append("分析过程中遇到工具执行错误，已基于当前已知信息提供部分分析：\n");
+                            finalAnswer.append(generateSummaryFromSteps(steps, collectedData));
+                            break;
+                        }
+
+                    } else {
+                        log.error("收到未知 Action 类型: {}", actionType);
+                        break;
+                    }
+
+                    // 达到最大尝试次数后的降级处理
+                    if (iteration == MAX_ITERATIONS) {
+                        log.warn("达到最大迭代次数 {}，强制生成总结响应", MAX_ITERATIONS);
+                        finalAnswer.append(generateSummaryFromSteps(steps, collectedData));
+                    }
+                }
+
+                // 6. 整合结果并构建最终 AgentResponse
+                AgentResponse response = buildFinalResponse(
+                        sessionId, enhancedInput, scenario, steps,
+                        finalAnswer.toString(), allDocuments, collectedData,
+                        memoryContext, riskAssessment, userId
+                );
+
+                // 7. 异步更新用户长期记忆
+                asyncUpdateUserMemory(userId, session, response);
+
+                return response;
+
+            } catch (Exception e) {
+                log.error("ReAct 核心循环异常", e);
+                return createErrorResponse(sessionId, userInput, e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * 执行单个工具调用的辅助方法
+     */
+    private CompletableFuture<Map<String, Object>> executeSingleTool(
+            AgentDecision.ToolCallRequest toolCall,
+            SessionManager session) {
+
+        String toolName = toolCall.getTool();
+        Map<String, Object> params = toolCall.getParameters();
+        AgentTool tool = availableTools.get(toolName);
+
+        if (tool == null) {
+            log.warn("工具库中不存在: {}", toolName);
+            return CompletableFuture.completedFuture(Map.of("tool", toolName, "result", "Error: Tool not found"));
+        }
+
+        return tool.execute(params, session)
+                .thenApply(result -> {
+                    Map<String, Object> resultMap = new HashMap<>();
+                    resultMap.put("tool", toolName);
+                    resultMap.put("result", result);
+                    return resultMap;
+                })
+                .exceptionally(ex -> {
+                    log.error("工具 {} 执行异常", toolName, ex);
+                    return Map.of("tool", toolName, "result", "Error: " + ex.getMessage());
+                });
+    }
+
+    /**
+     * 异步更新用户长期记忆 (Profile Update)
+     */
+    private void asyncUpdateUserMemory(String userId, SessionManager session, AgentResponse response) {
+        if (StringUtils.isNotBlank(userId) && session != null) {
+            CompletableFuture.runAsync(() -> {
+                log.debug("正在为用户 {} 更新风险偏好和历史记录", userId);
+                memoryService.updateMemoryAsync(userId, session.getMessageHistory());
+            }, CompletableFuture.delayedExecutor(500, java.util.concurrent.TimeUnit.MILLISECONDS));
+        }
+    }
+
     /**
      * 核心思考方法：调用 LangChain4j Agent
      * 不再需要手动解析 JSON 字符串
