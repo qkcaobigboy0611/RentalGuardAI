@@ -39,7 +39,6 @@ public class OptimizedAgentOrchestrator {
     // 保留 LLMService 用于简单的场景识别和图片分析
     @Autowired
     private LLMService llmService;
-
     @Autowired
     private RAGService ragService;
     @Autowired
