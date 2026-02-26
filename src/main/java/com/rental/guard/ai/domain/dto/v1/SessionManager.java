@@ -36,8 +36,15 @@ public class SessionManager implements Serializable {
     private Map<String, Integer> scenarioCounter;
     private String currentScenario;
     private String riskProfile; // 用户风险画像
+    private double userExperienceScore = 0.0; // 用户经验分
+    private RiskStatus riskStatus = RiskStatus.SAFE;
 
     private Long ttl = 1800L; // 30分钟过期
+
+    // 优化：使用更科学的风险状态枚举
+    public enum RiskStatus {
+        SAFE, ALERT, DANGER, BLACKLIST
+    }
 
     // 非持久化字段
     @JsonIgnore
@@ -66,6 +73,10 @@ public class SessionManager implements Serializable {
                 UUID.randomUUID().toString().substring(0, 8);
     }
 
+    /**
+     * 优化点 1：消息列表优化
+     * 建议将消息历史限制在最近的 20-30 条，历史消息应归档至持久化数据库
+     */
     public void addMessage(Message message) {
         this.messageHistory.add(message);
         this.lastActiveAt = new Date();
@@ -151,5 +162,42 @@ public class SessionManager implements Serializable {
         }
 
         return sb.toString();
+    }
+
+    /**
+     * 优化点 2：内聚风险校准逻辑 (针对你提供的 calibrateRiskLevel)
+     * 将风险评估逻辑转化为一种“信任分”累加
+     */
+    public void calibrateRiskLevel(AgentResponse response) {
+        int totalInteractions = scenarioCounter.values().stream().mapToInt(Integer::intValue).sum();
+
+        // 动态计算用户信任权重
+        double trustFactor = Math.min(1.0, totalInteractions / 50.0); // 互动越多，信任度越高
+
+        String currentLevel = response.getRiskLevel();
+
+        if (trustFactor > 0.2 && "高风险".equals(currentLevel)) {
+            // 对资深用户（互动 > 10次）进行风险平滑处理
+            response.setRiskLevel("中高风险");
+            response.appendDetailedAnalysis("\n💡 提示：基于您的历史使用习惯，系统已为您过滤掉部分常规警示。");
+        }
+
+        // 更新用户经验分
+        this.userExperienceScore = trustFactor * 100;
+    }
+
+    /**
+     * 优化点 3：重构 RiskProfile 更新逻辑
+     */
+    public void updateRiskProfile(AgentResponse response) {
+        double currentRiskScore = response.getRiskScore();
+
+        // 自动演进用户画像
+        if (currentRiskScore > 0.8) {
+            this.riskStatus = RiskStatus.DANGER;
+            this.riskProfile = "易受损用户 - 频繁遭遇霸王条款";
+        } else if (this.userExperienceScore > 50) {
+            this.riskProfile = "资深租客 - 具备基础法律辨析力";
+        }
     }
 }
