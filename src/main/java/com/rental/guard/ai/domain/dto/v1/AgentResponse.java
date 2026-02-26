@@ -40,11 +40,31 @@ public class AgentResponse {
     private ResponseType responseType;
     private LocalDateTime generatedAt;
 
+    // ========== 风险评估 ==========
+    private Double riskScore; // 风险评分 0-1
+    @Builder.Default
+    private List<String> riskFactors = new ArrayList<>(); // 风险因素
+    @Builder.Default
+    private Map<String, Double> riskBreakdown = new HashMap<>(); // 风险分解
+
+
     // 核心内容
     private String coreLogic;
     private String detailedAnalysis;
     private String riskLevel; // 极高、高、中、低
     private Double confidence; // 置信度 0-1
+
+    /**
+     * 优化：提供流式追加详细分析的方法
+     */
+    public AgentResponse appendDetailedAnalysis(String text) {
+        if (this.detailedAnalysis == null) {
+            this.detailedAnalysis = text;
+        } else {
+            this.detailedAnalysis += text;
+        }
+        return this;
+    }
 
     // 结构化数据
     @Builder.Default
@@ -90,6 +110,11 @@ public class AgentResponse {
     @AllArgsConstructor
     @NoArgsConstructor
     public static class RetrievedDocument {
+        // --- 优化新增字段 ---
+        private String type;    // 类型：例如 "法律法规", "百科", "合同模板"
+        private String title;   // 标题
+        private String summary; // 摘要
+
         private String documentId;
         private String source; // 来源：法律条文、市场数据、历史案例等
         private String content;
@@ -338,5 +363,53 @@ public class AgentResponse {
         }
 
         return sb.toString();
+    }
+
+    /**
+     * 优化：添加风险因素，并自动调整整体风险评分
+     * @param factor 风险因素名称
+     * @param weight 该因素的风险权重 (0.0 - 1.0)
+     */
+    public AgentResponse addRiskFactor(String factor, Double weight) {
+        if (this.riskFactors == null) this.riskFactors = new ArrayList<>();
+        if (this.riskBreakdown == null) this.riskBreakdown = new HashMap<>();
+
+        if (!this.riskFactors.contains(factor)) {
+            this.riskFactors.add(factor);
+            this.riskBreakdown.put(factor, weight);
+
+            // 简单的评分累加算法（可根据业务调整逻辑）
+            if (this.riskScore == null) this.riskScore = 0.0;
+            this.riskScore = Math.min(1.0, this.riskScore + weight);
+
+            // 自动更新风险等级文字
+            updateRiskLevelByScore();
+        }
+        return this;
+    }
+
+    private void updateRiskLevelByScore() {
+        if (this.riskScore >= 0.8) this.riskLevel = "极高";
+        else if (this.riskScore >= 0.5) this.riskLevel = "高";
+        else if (this.riskScore >= 0.3) this.riskLevel = "中";
+        else this.riskLevel = "低";
+    }
+
+    /**
+     * 优化：批量添加建议项
+     */
+    public AgentResponse addRecommendations(List<String> list) {
+        if (this.recommendations == null) this.recommendations = new ArrayList<>();
+        this.recommendations.addAll(list);
+        return this;
+    }
+
+    /**
+     * 优化：向元数据中存入结构化信息，方便前端展示小图标或标签
+     */
+    public AgentResponse putMetadata(String key, Object value) {
+        if (this.metadata == null) this.metadata = new HashMap<>();
+        this.metadata.put(key, value);
+        return this;
     }
 }

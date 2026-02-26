@@ -175,4 +175,68 @@ public class QdrantService {
         ListenableFuture<List<Points.ScoredPoint>> listListenableFuture = client.searchAsync(searchReq);
         return listListenableFuture;
     }
+
+    /**
+     * 向指定集合中插入或更新一个向量点位
+     * 适用于长期记忆存储等场景
+     *
+     * @param collectionName 集合名称 (如 "user_memories")
+     * @param vectorId      点位的 UUID 字符串
+     * @param vector        向量数据 (List<Float>)
+     * @param content       记忆正文或摘要内容
+     */
+    public void upsertPoint(String collectionName, String vectorId, List<Float> vector, String content) {
+        try {
+            if (vector == null || vector.isEmpty()) {
+                log.error("向量为空，无法存储到集合: {}", collectionName);
+                return;
+            }
+
+            // 1. 构建 Payload (元数据)
+            Map<String, Value> payload = new HashMap<>();
+            // 存储记忆正文内容
+            payload.put("content", Value.newBuilder()
+                    .setStringValue(content != null ? content : "")
+                    .build());
+            // 存储 ID 以便回查
+            payload.put("id", Value.newBuilder()
+                    .setStringValue(vectorId)
+                    .build());
+            // 可以根据需要添加时间戳
+            payload.put("created_at", Value.newBuilder()
+                    .setStringValue(java.time.LocalDateTime.now().toString())
+                    .build());
+
+            // 2. 构建向量点位结构 (PointStruct)
+            Points.PointStruct point = Points.PointStruct.newBuilder()
+                    // 注意：这里使用 setUuid 处理字符串类型的 ID
+                    .setId(Points.PointId.newBuilder()
+                            .setUuid(vectorId)
+                            .build())
+                    .setVectors(Points.Vectors.newBuilder()
+                            .setVector(Points.Vector.newBuilder()
+                                    .addAllData(vector)
+                                    .build())
+                            .build())
+                    .putAllPayload(payload)
+                    .build();
+
+            // 3. 执行异步插入并同步等待结果
+            client.upsertAsync(
+                    Points.UpsertPoints.newBuilder()
+                            .setCollectionName(collectionName)
+                            .addPoints(point)
+                            .setWait(true) // 确保写入磁盘后再返回
+                            .build()
+            ).get();
+
+            log.info("成功存储向量点位到集合 [{}], ID: {}, 向量维度: {}",
+                    collectionName, vectorId, vector.size());
+
+        } catch (Exception e) {
+            log.error("存储向量点位失败, 集合: {}, ID: {}, 错误: {}",
+                    collectionName, vectorId, e.getMessage(), e);
+            throw new RuntimeException("Qdrant upsertPoint failed", e);
+        }
+    }
 }

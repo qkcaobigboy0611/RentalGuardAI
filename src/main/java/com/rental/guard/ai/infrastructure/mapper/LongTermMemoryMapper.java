@@ -6,6 +6,7 @@ package com.rental.guard.ai.infrastructure.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.rental.guard.ai.infrastructure.po.LongTermMemory;
+import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
@@ -44,4 +45,12 @@ public interface LongTermMemoryMapper extends BaseMapper<LongTermMemory> {
     })
     List<LongTermMemory> searchByKeyword(@Param("userId") String userId,
                                          @Param("keyword") String keyword);
+
+
+    @Insert("INSERT INTO long_term_memory(user_id, session_id, scenario, memory_key, memory_content, importance_score, vector_id, created_at) " +
+            "VALUES(#{userId}, #{sessionId}, #{scenario}, #{memoryKey}, #{memoryContent}, #{importanceScore}, #{vectorId}, NOW())")
+    int insert(LongTermMemory memory);
+
+    @Select("SELECT * FROM long_term_memory WHERE user_id = #{userId} ORDER BY importance_score DESC LIMIT 10")
+    List<LongTermMemory> selectTopMemoriesByUser(@Param("userId") String userId);
 }

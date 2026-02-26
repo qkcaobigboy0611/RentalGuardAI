@@ -6,6 +6,7 @@ package com.rental.guard.ai.domain.dto.v1;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.rental.guard.ai.domain.service.v1.LongTermMemoryService;
 import com.rental.guard.ai.domain.service.v1.SessionContext;
 import lombok.Data;
 import org.springframework.data.redis.core.RedisHash;
@@ -14,7 +15,9 @@ import java.io.Serializable;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * 会话管理核心类 - 基于Redis的分布式会话管理
@@ -198,6 +201,27 @@ public class SessionManager implements Serializable {
             this.riskProfile = "易受损用户 - 频繁遭遇霸王条款";
         } else if (this.userExperienceScore > 50) {
             this.riskProfile = "资深租客 - 具备基础法律辨析力";
+        }
+    }
+
+    /**
+     * 当会话消息达到一定数量或用户主动结束时，触发异步归档。
+     * @param memoryService
+     */
+    public void checkAndTriggerArchive(LongTermMemoryService memoryService) {
+        // 如果消息超过 20 条，或者会话进入完成状态
+        if (this.messageHistory.size() >= 20) {
+            String historyText = getRecentMessages(20).stream()
+                    .map(Message::toString)
+                    .collect(Collectors.joining("\n"));
+
+            // 异步归档，不阻塞主流程
+            CompletableFuture.runAsync(() ->
+                    memoryService.archiveSession(userId, sessionId, currentScenario, historyText)
+            );
+
+            // 归档后清理短期内存，防止 Redis 爆炸
+            this.messageHistory.clear();
         }
     }
 }

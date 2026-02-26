@@ -5,12 +5,15 @@
 package com.rental.guard.ai.domain.service.v1;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.rental.guard.ai.domain.dto.v1.Message;
 import com.rental.guard.ai.domain.service.LLMService;
 import com.rental.guard.ai.infrastructure.mapper.LongTermMemoryMapper;
 import com.rental.guard.ai.infrastructure.mapper.UserProfileMapper;
 import com.rental.guard.ai.infrastructure.po.LongTermMemory;
 import com.rental.guard.ai.infrastructure.po.UserProfile;
+import com.rental.guard.ai.infrastructure.service.EmbeddingService;
+import io.qdrant.client.grpc.Points;
 import lombok.Builder;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -23,6 +26,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -40,6 +44,10 @@ public class LongTermMemoryService {
     private LongTermMemoryMapper memoryRepository;
     @Autowired
     private UserProfileMapper userProfileMapper;
+    @Autowired
+    private EmbeddingService embeddingService;
+
+    private final QdrantService qdrantService;
     private final RedisTemplate<String, String> redisTemplate;
     private final LLMService llmService;
     private final ObjectMapper objectMapper;
@@ -728,6 +736,109 @@ public class LongTermMemoryService {
             log.error("获取所有黑名单失败", e);
             return allBlacklists;
         }
+    }
+
+    /**
+     * 归档会话记忆：将短期对话压缩并存入长期记忆
+     */
+    public void archiveSession(String userId, String sessionId, String scenario, String fullChatHistory) {
+        try {
+            // 1. 调用 LLM 生成压缩摘要 (关键：提取特征)
+            String prompt = "请分析以下租房咨询对话，提取核心事实（房东信息、合同关键金额、风险点），" +
+                    "生成一段150字以内的语义记忆摘要。对话内容：" + fullChatHistory;
+            String summary = llmService.generate(prompt);
+
+            // 2. 生成向量
+            List<Float> vector = embeddingService.getEmbedding(summary);
+            String vectorId = UUID.randomUUID().toString();
+
+            // 3. 存入向量数据库 (语义搜索用)
+            qdrantService.upsertPoint("user_memories", vectorId, vector, summary);
+
+            // 4. 存入 MySQL (结构化展示用)
+            LongTermMemory memory = LongTermMemory.builder()
+                    .userId(userId)
+                    .sessionId(sessionId)
+                    .scenario(scenario)
+                    .memoryKey(scenario + "_summary")
+                    .memoryContent(summary)
+                    .importanceScore(0.8) // 默认高，可根据 LLM 判定调整
+                    .vectorId(vectorId)
+                    .build();
+            memoryRepository.insert(memory);
+
+            log.info("会话记忆已成功归档 - User: {}, VectorId: {}", userId, vectorId);
+        } catch (Exception e) {
+            log.error("归档长期记忆失败", e);
+        }
+    }
+
+    /**
+     * 加载相关记忆：为当前请求提供背景（优化异步处理版本）
+     */
+    public String retrieveRelevantMemories(String userId, String query) {
+        // 1. 获取查询向量 (通常是同步操作)
+        List<Float> queryVector = embeddingService.getEmbedding(query);
+
+        // 2. 构建 Qdrant 搜索请求
+        Points.SearchPoints searchReq = Points.SearchPoints.newBuilder()
+                .setCollectionName("user_memories")
+                .addAllVector(queryVector)
+                .setLimit(3)
+                .setWithPayload(Points.WithPayloadSelector.newBuilder()
+                        .setEnable(true)
+                        .build())
+                .setScoreThreshold(0.7f)
+                .build();
+
+        // 3. 【关键优化点】发起异步搜索，不阻塞，立即向下执行
+        ListenableFuture<List<Points.ScoredPoint>> qdrantFuture = qdrantService.searchAsync(searchReq);
+
+        // 4. 【并行执行】在等待 Qdrant 返回的过程中，去查询 MySQL
+        // 这样 Qdrant 的网络 IO 和 MySQL 的磁盘 IO 是并行的
+        List<LongTermMemory> topMemories = memoryRepository.selectTopMemoriesByUser(userId);
+
+        StringBuilder sb = new StringBuilder("【用户历史背景记忆】\n");
+
+        try {
+            // 5. 等待并获取 Qdrant 的异步结果 (阻塞直到超时或返回)
+            // 建议加上超时时间，防止 Qdrant 挂了导致整个接口卡死，例如：qdrantFuture.get(2, TimeUnit.SECONDS)
+            List<Points.ScoredPoint> scoredPoints = qdrantFuture.get();
+
+            // 6. 处理语义记忆结果
+            if (scoredPoints != null && !scoredPoints.isEmpty()) {
+                for (Points.ScoredPoint point : scoredPoints) {
+                    // 从 Payload 中提取之前存入的文本内容 (假设 Key 为 "content")
+                    String content = "";
+                    if (point.containsPayload("content")) {
+                        content = point.getPayloadMap().get("content").getStringValue();
+                    } else if (point.containsPayload("summary")) {
+                        content = point.getPayloadMap().get("summary").getStringValue();
+                    }
+
+                    if (!content.isEmpty()) {
+                        sb.append("- 相关历史记录: ").append(content)
+                                .append(" (相关度: ").append(String.format("%.2f", point.getScore())).append(")\n");
+                    }
+                }
+            } else {
+                sb.append("- 暂无相关语义记忆\n");
+            }
+
+        } catch (InterruptedException | ExecutionException e) {
+            // 7. 异常处理：如果向量搜索失败，记录日志并降级处理（仅显示 MySQL 记忆）
+            log.error("Qdrant 异步搜索异常，用户: {}", userId, e);
+            sb.append("- [警告] 语义记忆检索暂时不可用\n");
+            // 保持线程中断状态
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+        }
+
+        // 8. 组合 MySQL 存储的置信度最高的记忆
+        if (topMemories != null && !topMemories.isEmpty()) {
+            topMemories.forEach(m -> sb.append("- 关键偏好特征: ").append(m.getMemoryContent()).append("\n"));
+        }
+
+        return sb.toString();
     }
 }
 
