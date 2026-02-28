@@ -26,6 +26,8 @@ import static io.micrometer.common.util.StringUtils.truncate;
  * 1. 【架构升级】引入 LangChain4j 的 @AiService，替代手动 JSON 拼接和解析。
  * 2. 【类型安全】使用 AgentDecision 强类型对象，彻底解决 "Fragile Parsing" 问题。
  * 3. 【逻辑简化】核心循环逻辑更清晰，专注于业务流转而非字符串处理。
+ * <p>
+ * 解决幻觉方案：强类型 POJO + 负反馈 Observation + 动态工具描述
  */
 @Slf4j
 public class ReActEngine {
@@ -118,6 +120,7 @@ public class ReActEngine {
                     log.info("ReAct循环第 {} 次迭代，会话: {}", iteration, sessionId);
 
                     // --- 1. 思考阶段 (通过 LangChain4j 获取结构化决策) ---
+                    // 这里利用 LangChain4j 的结构化输出防止格式幻觉
                     AgentDecision decision = thinkAndDecide(
                             enhancedInput,
                             scenario,
@@ -134,6 +137,7 @@ public class ReActEngine {
                     steps.add(currentStep);
 
                     // --- 2. 行动阶段 ---
+                    // 执行与抗幻觉校验
                     if ("final_answer".equals(actionType)) {
                         // case: 给出最终答案
                         String answer = decision.getAnswer();
@@ -148,7 +152,7 @@ public class ReActEngine {
                     } else if ("tool_call".equals(actionType)) {
                         // case: 调用工具
                         List<AgentDecision.ToolCallRequest> toolCalls = decision.getToolCalls();
-
+                        //处理"空调用"幻觉
                         if (toolCalls == null || toolCalls.isEmpty()) {
                             log.warn("决策为 tool_call 但未提供工具列表，跳过本次执行");
                             continue;
@@ -159,29 +163,10 @@ public class ReActEngine {
                         inputLog.put("calls", toolCalls);
                         currentStep.setActionInput(inputLog);
 
-                        // 并行执行工具调用
+                        // 并行执行工具调用，并捕获"工具名"幻觉
                         List<CompletableFuture<Map<String, Object>>> toolFutures = new ArrayList<>();
-                        int toolCount = Math.min(toolCalls.size(), MAX_TOOL_CALLS_PER_STEP);
-
-                        for (int i = 0; i < toolCount; i++) {
-                            AgentDecision.ToolCallRequest toolCall = toolCalls.get(i);
-                            String toolName = toolCall.getTool();
-                            Map<String, Object> params = toolCall.getParameters();
-
-                            AgentTool tool = availableTools.get(toolName);
-                            if (tool != null) {
-                                toolFutures.add(
-                                        tool.execute(params, session)
-                                                .thenApply(result -> {
-                                                    Map<String, Object> resultMap = new HashMap<>();
-                                                    resultMap.put("tool", toolName);
-                                                    resultMap.put("result", result);
-                                                    return resultMap;
-                                                })
-                                );
-                            } else {
-                                log.warn("未找到工具: {}", toolName);
-                            }
+                        for (int i = 0; i < Math.min(toolCalls.size(), MAX_TOOL_CALLS_PER_STEP); i++) {
+                            toolFutures.add(executeSingleToolWithValidation(toolCalls.get(i), session));
                         }
 
                         // 等待执行完成
@@ -210,11 +195,16 @@ public class ReActEngine {
                     } else {
                         log.warn("模型返回了未知的动作类型: {}", actionType);
                         // 尝试纠正或中断，这里选择中断防止死循环
-                        break;
+                        // 处理"未知 Action"幻觉
+                        currentStep.setObservation("Error: Unknown action '" + actionType + "'. Valid actions are: [tool_call, final_answer].");
                     }
 
                     // 检查最大迭代
                     if (iteration >= MAX_ITERATIONS) {
+                        if (iteration == MAX_ITERATIONS) {
+                            finalAnswer.append("已达到最大分析深度。结论：\n").append(generateSummaryFromSteps(steps, collectedData));
+                        }
+
                         log.info("达到最大迭代次数: {}", MAX_ITERATIONS);
                         if (finalAnswer.length() == 0) {
                             finalAnswer.append("基于已有信息总结：\n")
@@ -249,12 +239,42 @@ public class ReActEngine {
         });
     }
 
+    /**
+     * 带验证的工具执行 - 专门解决名称和参数幻觉
+     */
+    private CompletableFuture<Map<String, Object>> executeSingleToolWithValidation(
+            AgentDecision.ToolCallRequest toolCall,
+            SessionManager session) {
+
+        String toolName = toolCall.getTool();
+        Map<String, Object> params = toolCall.getParameters();
+        AgentTool tool = availableTools.get(toolName);
+
+        // 【抗幻觉校验 1】：检查工具是否存在
+        if (tool == null) {
+            log.warn("检测到工具名幻觉: {}", toolName);
+            String errorMsg = String.format("Error: Tool '%s' not found. Available tools: %s",
+                    toolName, availableTools.keySet());
+            return CompletableFuture.completedFuture(Map.of("tool", toolName, "result", errorMsg));
+        }
+
+        // 【抗幻觉校验 2】：执行并捕获参数错误
+        return tool.execute(params, session)
+                .thenApply(result -> Map.of("tool", toolName, "result", result))
+                .exceptionally(ex -> {
+                    log.error("工具调用幻觉（参数或执行异常）: {}", toolName);
+                    // 反馈具体的错误，让模型下一次修正参数
+                    return Map.of("tool", toolName, "result", "Execution Error: " + ex.getMessage());
+                });
+    }
+
 
     /**
      * 执行增强版的 ReAct 循环 - 支持预取数据的注入
      * * @param preFetchedDocs  预取的 RAG 文档
-     * @param searchContent   预取的联网搜索结果
-     * @param mcpResponse     预取的 MCP 服务器响应
+     *
+     * @param searchContent 预取的联网搜索结果
+     * @param mcpResponse   预取的 MCP 服务器响应
      */
     public CompletableFuture<AgentResponse> executeReActLoop(
             String sessionId,
@@ -505,7 +525,7 @@ public class ReActEngine {
 
         // 3. 历史思考路径
         if (!steps.isEmpty()) {
-            sb.append("### 思考历史 (Trace)\n");
+            sb.append("\n### 执行历史与观察 (如果 Observation 包含 Error，请修正后重试)\n");
             for (ReActStep step : steps) {
                 sb.append("Step ").append(step.getStepNumber()).append(":\n");
                 sb.append("  Thought: ").append(step.getThought()).append("\n");
