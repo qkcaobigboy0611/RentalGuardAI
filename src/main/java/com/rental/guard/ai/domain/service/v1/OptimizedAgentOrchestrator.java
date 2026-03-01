@@ -4,6 +4,7 @@
  */
 package com.rental.guard.ai.domain.service.v1;
 
+import com.rental.guard.ai.domain.dto.ApiResponse;
 import com.rental.guard.ai.domain.dto.v1.AgentResponse;
 import com.rental.guard.ai.domain.dto.v1.Message;
 import com.rental.guard.ai.domain.dto.v1.SessionManager;
@@ -13,11 +14,14 @@ import com.rental.guard.ai.domain.service.v1.tool.AgentTool;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.service.AiServices;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -49,17 +53,22 @@ public class OptimizedAgentOrchestrator {
     // 【修改点1】移除 ObjectMapper，引入 LangChain4j 的 ChatLanguageModel
     @Autowired
     private ChatLanguageModel chatLanguageModel;
-
     @Autowired
     private List<AgentTool> agentTools; // Spring会自动注入所有实现AgentTool的Bean
     @Autowired
     private LongTermMemoryService memoryService;
     @Autowired
     private SimpleKnowledgeGraphService kgService;
+    @Resource
+    private RedisTemplate<String, Object> redisTemplate;
+
+
+    private static final String LOCK_PREFIX = "lock:session:";
 
     private final ExecutorService executorService = Executors.newFixedThreadPool(15);
     private ReActEngine reActEngine;
     private final Map<String, ScenarioHandler> scenarioHandlers = new HashMap<>();
+
 
     @Autowired
     public OptimizedAgentOrchestrator() {
@@ -107,6 +116,18 @@ public class OptimizedAgentOrchestrator {
             String userId) {
 
         return CompletableFuture.supplyAsync(() -> {
+            String lockKey = LOCK_PREFIX + sessionId;
+            // 1. 尝试获取分布式锁 (SETNX)
+            // 设置 120 秒超时，覆盖长周期的 ReAct 循环执行时间
+            Boolean acquired = redisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, "LOCKED", Duration.ofSeconds(120));
+
+            if (Boolean.FALSE.equals(acquired)) {
+                log.warn("Session {} 冲突，已有任务正在处理中", sessionId);
+                // 返回提示，告知用户智能体正在处理上一条消息
+                return createBusyResponse(sessionId, "智能体正在深入分析中，请稍后再试。");
+            }
+
             try {
                 // 1. 获取或创建会话(引入长期记忆管理器和简易知识图谱服务)
                 SessionManager session = sessionRepository.getOrCreateSession(sessionId);
@@ -125,6 +146,7 @@ public class OptimizedAgentOrchestrator {
 
                 log.info("开始ReAct处理 - 会话: {}, 场景: {}", sessionId, scenario);
 
+                // --- 并行执行上下文增强任务 ---
                 // 【优化点】并行执行：RAG检索 + MCP上下文构建 + 联网搜索
                 // 1) 实时搜索数据
                 CompletableFuture<String> searchFuture = CompletableFuture
@@ -147,7 +169,7 @@ public class OptimizedAgentOrchestrator {
                 List<AgentResponse.RetrievedDocument> ragResults = ragFuture.get();
                 Map<String, Object> mcpContext = mcpContextFuture.get();
 
-                // 5. 调用 MCP 服务器获取增强背景
+                // 4) 调用 MCP 服务器获取增强背景
                 Map<String, Object> mcpResponse = mcpService.callMCPServer(sessionId, mcpContext);
 
                 // 6. 执行 ReAct 循环 (注入预先获取的上下文，显著提升首轮思考质量)
@@ -157,19 +179,17 @@ public class OptimizedAgentOrchestrator {
                         ragResults, searchContent, mcpResponse
                 ).join();
 
-                // 6. 应用场景特定处理
+                // 7. 场景特定后处理
                 ScenarioHandler handler = scenarioHandlers.getOrDefault(
                         scenario, new DefaultScenarioHandler());
                 handler.process(response, session, response.getSupportingDocuments());
 
-                // 7. 保存智能体响应
+                // 8. 保存智能体响应并更新画像
                 Message agentMessage = Message.createAgentMessage(sessionId, response);
                 session.addMessage(agentMessage);
-
-                // 8. 更新会话风险画像
                 session.updateRiskProfile(response.getRiskLevel(), scenario);
 
-                // 9. 保存会话
+                // 9. 持久化保存 (此时保存的是最新的、完整的状态)
                 sessionRepository.saveSession(session);
 
                 log.info("ReAct处理完成 - 会话: {}, 风险等级: {}, 置信度: {}",
@@ -180,6 +200,10 @@ public class OptimizedAgentOrchestrator {
             } catch (Exception e) {
                 log.error("ReAct处理失败", e);
                 return createErrorResponse(sessionId, userInput, e.getMessage());
+            } finally {
+                // 10. 【关键】无论成功失败，必须释放锁
+                redisTemplate.delete(lockKey);
+                log.info("已释放 Session {} 的分布式锁", sessionId);
             }
         }, executorService);
     }
@@ -353,5 +377,13 @@ public class OptimizedAgentOrchestrator {
         public void process(AgentResponse response, SessionManager session, List<AgentResponse.RetrievedDocument> docs) {
             // 霸王条款后处理逻辑
         }
+    }
+
+    private AgentResponse createBusyResponse(String sessionId, String message) {
+        return AgentResponse.builder()
+                .sessionId(sessionId)
+                .responseType(AgentResponse.ResponseType.ERROR)
+                .detailedAnalysis(message)
+                .build();
     }
 }
