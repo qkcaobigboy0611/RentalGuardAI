@@ -68,206 +68,6 @@ public class ReActEngine {
         this.kgService = kgService;
     }
 
-    /**
-     * 执行ReAct循环
-     */
-    public CompletableFuture<AgentResponse> executeReActLoop(
-            String sessionId,
-            String userInput,
-            SessionManager session,
-            String scenario,
-            String userId) {
-
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                // 0. 预加载上下文：获取记忆和风险检测（并行执行）
-                CompletableFuture<String> memoryFuture = CompletableFuture.supplyAsync(() ->
-                        memoryService.getUserMemoryContext(sessionId, userId)
-                );
-                CompletableFuture<RiskAssessment> riskFuture = CompletableFuture.supplyAsync(() ->
-                        kgService.assessRisk(userInput)
-                );
-
-                CompletableFuture.allOf(memoryFuture, riskFuture).join();
-                String memoryContext = memoryFuture.get();
-                RiskAssessment riskAssessment = riskFuture.get();
-
-                // 1. 构建增强的用户输入
-                String enhancedInput = buildEnhancedInput(userInput, memoryContext, riskAssessment);
-
-                // 2. 执行ReAct思考循环
-                List<ReActStep> steps = new ArrayList<>();
-                StringBuilder finalAnswer = new StringBuilder();
-                List<AgentResponse.RetrievedDocument> allDocuments = new ArrayList<>();
-                Map<String, Object> collectedData = new ConcurrentHashMap<>();
-
-                // 将风险检测结果存入收集数据
-                if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
-                    collectedData.put("risk_assessment", riskAssessment);
-                }
-
-                // 初始思考记录
-                String initialThought = "开始分析用户问题：" + userInput;
-                if (riskAssessment != null && !riskAssessment.getMatches().isEmpty()) {
-                    initialThought += "（检测到" + riskAssessment.getMatches().size() + "个风险实体）";
-                }
-
-                ReActStep currentStep = new ReActStep(0, initialThought);
-                steps.add(currentStep);
-
-                // ReAct循环主体
-                for (int iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-                    log.info("ReAct循环第 {} 次迭代，会话: {}", iteration, sessionId);
-
-                    // --- 1. 思考阶段 (通过 LangChain4j 获取结构化决策) ---
-                    // 这里利用 LangChain4j 的结构化输出防止格式幻觉
-                    AgentDecision decision = thinkAndDecide(
-                            enhancedInput,
-                            scenario,
-                            steps,
-                            collectedData
-                    );
-
-                    String actionType = decision.getAction();
-                    String reasoning = decision.getReasoning();
-
-                    // 记录思考步骤
-                    currentStep = new ReActStep(iteration, reasoning);
-                    currentStep.setAction(actionType);
-                    steps.add(currentStep);
-
-                    // --- 2. 行动阶段 ---
-                    // 执行与抗幻觉校验
-                    if ("final_answer".equals(actionType)) {
-                        // case: 给出最终答案
-                        String answer = decision.getAnswer();
-                        if (StringUtils.isBlank(answer)) {
-                            // 容错：如果模型未填 answer 但填了 reasoning
-                            answer = reasoning;
-                        }
-                        finalAnswer.append(answer);
-                        log.info("ReAct循环结束，生成最终答案");
-                        break;
-
-                    } else if ("tool_call".equals(actionType)) {
-                        // case: 调用工具
-                        List<AgentDecision.ToolCallRequest> toolCalls = decision.getToolCalls();
-                        //处理"空调用"幻觉
-                        if (toolCalls == null || toolCalls.isEmpty()) {
-                            log.warn("决策为 tool_call 但未提供工具列表，跳过本次执行");
-                            continue;
-                        }
-
-                        // 记录 Input 用于调试
-                        Map<String, Object> inputLog = new HashMap<>();
-                        inputLog.put("calls", toolCalls);
-                        currentStep.setActionInput(inputLog);
-
-                        // 并行执行工具调用，并捕获"工具名"幻觉
-                        List<CompletableFuture<Map<String, Object>>> toolFutures = new ArrayList<>();
-                        for (int i = 0; i < Math.min(toolCalls.size(), MAX_TOOL_CALLS_PER_STEP); i++) {
-                            toolFutures.add(executeSingleToolWithValidation(toolCalls.get(i), session));
-                        }
-
-                        // 等待执行完成
-                        if (!toolFutures.isEmpty()) {
-                            CompletableFuture.allOf(toolFutures.toArray(new CompletableFuture[0])).join();
-                        }
-
-                        // 收集结果
-                        List<Map<String, Object>> observations = new ArrayList<>();
-                        for (CompletableFuture<Map<String, Object>> future : toolFutures) {
-                            observations.add(future.join());
-                        }
-
-                        currentStep.setObservation(observations);
-
-                        // 处理并归档工具结果
-                        processToolResults(observations, collectedData, allDocuments);
-
-                        // 错误检测
-                        boolean shouldContinue = evaluateShouldContinue(observations);
-                        if (!shouldContinue) {
-                            log.info("ReAct循环因工具执行错误提前结束，迭代次数: {}", iteration);
-                            break;
-                        }
-
-                    } else {
-                        log.warn("模型返回了未知的动作类型: {}", actionType);
-                        // 尝试纠正或中断，这里选择中断防止死循环
-                        // 处理"未知 Action"幻觉
-                        currentStep.setObservation("Error: Unknown action '" + actionType + "'. Valid actions are: [tool_call, final_answer].");
-                    }
-
-                    // 检查最大迭代
-                    if (iteration >= MAX_ITERATIONS) {
-                        if (iteration == MAX_ITERATIONS) {
-                            finalAnswer.append("已达到最大分析深度。结论：\n").append(generateSummaryFromSteps(steps, collectedData));
-                        }
-
-                        log.info("达到最大迭代次数: {}", MAX_ITERATIONS);
-                        if (finalAnswer.length() == 0) {
-                            finalAnswer.append("基于已有信息总结：\n")
-                                    .append(generateSummaryFromSteps(steps, collectedData));
-                        }
-                        break;
-                    }
-                }
-
-                // 3. 构建最终响应
-                AgentResponse response = buildFinalResponse(
-                        sessionId, enhancedInput, scenario, steps,
-                        finalAnswer.toString(), allDocuments, collectedData,
-                        memoryContext, riskAssessment, userId
-                );
-
-                // 4. 异步更新记忆
-                if (session != null && session.getMessageHistory() != null) {
-                    CompletableFuture.runAsync(() ->
-                            memoryService.updateMemoryAsync(userId, session.getMessageHistory())
-                    ).exceptionally(e -> {
-                        log.warn("异步更新记忆失败", e);
-                        return null;
-                    });
-                }
-                return response;
-
-            } catch (Exception e) {
-                log.error("ReAct循环执行失败", e);
-                return createErrorResponse(sessionId, userInput, e.getMessage());
-            }
-        });
-    }
-
-    /**
-     * 带验证的工具执行 - 专门解决名称和参数幻觉
-     */
-    private CompletableFuture<Map<String, Object>> executeSingleToolWithValidation(
-            AgentDecision.ToolCallRequest toolCall,
-            SessionManager session) {
-
-        String toolName = toolCall.getTool();
-        Map<String, Object> params = toolCall.getParameters();
-        AgentTool tool = availableTools.get(toolName);
-
-        // 【抗幻觉校验 1】：检查工具是否存在
-        if (tool == null) {
-            log.warn("检测到工具名幻觉: {}", toolName);
-            String errorMsg = String.format("Error: Tool '%s' not found. Available tools: %s",
-                    toolName, availableTools.keySet());
-            return CompletableFuture.completedFuture(Map.of("tool", toolName, "result", errorMsg));
-        }
-
-        // 【抗幻觉校验 2】：执行并捕获参数错误
-        return tool.execute(params, session)
-                .thenApply(result -> Map.of("tool", toolName, "result", result))
-                .exceptionally(ex -> {
-                    log.error("工具调用幻觉（参数或执行异常）: {}", toolName);
-                    // 反馈具体的错误，让模型下一次修正参数
-                    return Map.of("tool", toolName, "result", "Execution Error: " + ex.getMessage());
-                });
-    }
-
 
     /**
      * 执行增强版的 ReAct 循环 - 支持预取数据的注入
@@ -352,6 +152,7 @@ public class ReActEngine {
                     steps.add(currentStep);
 
                     // --- 阶段 B: 行动 (Act) ---
+                    // 执行与抗幻觉校验
                     if ("final_answer".equals(actionType)) {
                         // 结束条件：模型认为信息已足够
                         String answer = decision.getAnswer();
@@ -397,14 +198,25 @@ public class ReActEngine {
                         }
 
                     } else {
-                        log.error("收到未知 Action 类型: {}", actionType);
-                        break;
+                        log.warn("模型返回了未知的动作类型: {}", actionType);
+                        // 尝试纠正或中断，这里选择中断防止死循环
+                        // 处理"未知 Action"幻觉
+                        currentStep.setObservation("Error: Unknown action '" + actionType + "'. Valid actions are: [tool_call, final_answer].");
+
                     }
 
                     // 达到最大尝试次数后的降级处理
-                    if (iteration == MAX_ITERATIONS) {
-                        log.warn("达到最大迭代次数 {}，强制生成总结响应", MAX_ITERATIONS);
-                        finalAnswer.append(generateSummaryFromSteps(steps, collectedData));
+                    if (iteration >= MAX_ITERATIONS) {
+                        if (iteration == MAX_ITERATIONS) {
+                            finalAnswer.append("已达到最大分析深度。结论：\n").append(generateSummaryFromSteps(steps, collectedData));
+                        }
+
+                        log.info("达到最大迭代次数: {}", MAX_ITERATIONS);
+                        if (finalAnswer.length() == 0) {
+                            finalAnswer.append("基于已有信息总结：\n")
+                                    .append(generateSummaryFromSteps(steps, collectedData));
+                        }
+                        break;
                     }
                 }
 
@@ -438,21 +250,21 @@ public class ReActEngine {
         Map<String, Object> params = toolCall.getParameters();
         AgentTool tool = availableTools.get(toolName);
 
+        // 【抗幻觉校验 1】：检查工具是否存在
         if (tool == null) {
-            log.warn("工具库中不存在: {}", toolName);
-            return CompletableFuture.completedFuture(Map.of("tool", toolName, "result", "Error: Tool not found"));
+            log.warn("检测到工具名幻觉: {}", toolName);
+            String errorMsg = String.format("Error: Tool '%s' not found. Available tools: %s",
+                    toolName, availableTools.keySet());
+            return CompletableFuture.completedFuture(Map.of("tool", toolName, "result", errorMsg));
         }
 
+        // 【抗幻觉校验 2】：执行并捕获参数错误
         return tool.execute(params, session)
-                .thenApply(result -> {
-                    Map<String, Object> resultMap = new HashMap<>();
-                    resultMap.put("tool", toolName);
-                    resultMap.put("result", result);
-                    return resultMap;
-                })
+                .thenApply(result -> Map.of("tool", toolName, "result", result))
                 .exceptionally(ex -> {
-                    log.error("工具 {} 执行异常", toolName, ex);
-                    return Map.of("tool", toolName, "result", "Error: " + ex.getMessage());
+                    log.error("工具调用幻觉（参数或执行异常）: {}", toolName);
+                    // 反馈具体的错误，让模型下一次修正参数
+                    return Map.of("tool", toolName, "result", "Execution Error: " + ex.getMessage());
                 });
     }
 
